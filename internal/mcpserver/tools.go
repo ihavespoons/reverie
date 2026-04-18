@@ -532,8 +532,9 @@ func (s *Server) handleReinforce(ctx context.Context, _ *mcpsdk.CallToolRequest,
 
 // ForgetInput is the input schema for the memory_forget tool.
 type ForgetInput struct {
-	ID    string `json:"id,omitempty" jsonschema:"ID of a specific memory to delete"`
-	Query string `json:"query,omitempty" jsonschema:"Query to find candidates for deletion (returns candidates without deleting)"`
+	ID    string   `json:"id,omitempty" jsonschema:"ID of a specific memory to delete"`
+	IDs   []string `json:"ids,omitempty" jsonschema:"Batch delete multiple memories by ID"`
+	Query string   `json:"query,omitempty" jsonschema:"Query to find candidates for deletion (returns candidates without deleting)"`
 }
 
 // ForgetCandidate is a candidate returned for confirmation when query is used.
@@ -543,10 +544,51 @@ type ForgetCandidate struct {
 	Layer   string `json:"layer"`
 }
 
+// ForgetFailure describes a per-ID failure during a batch forget.
+type ForgetFailure struct {
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
+}
+
 // ForgetOutput is the output schema for the memory_forget tool.
 type ForgetOutput struct {
 	Deleted    int               `json:"deleted"`
+	Failed     []ForgetFailure   `json:"failed,omitempty"`
 	Candidates []ForgetCandidate `json:"candidates,omitempty"`
+}
+
+// forgetOne attempts to delete a single memory by ID, fact-then-episode.
+// Returns (true, "") on success; (false, reason) on not-found or store error.
+func (s *Server) forgetOne(ctx context.Context, id string) (bool, string) {
+	if id == "" {
+		return false, "empty id"
+	}
+
+	fact, err := s.store.GetFact(ctx, id)
+	if err != nil {
+		return false, fmt.Sprintf("get fact: %v", err)
+	}
+	if fact != nil {
+		if delErr := s.store.DeleteFact(ctx, id); delErr != nil {
+			return false, fmt.Sprintf("delete fact: %v", delErr)
+		}
+		s.logger.Info("memory_forget", "deleted_id", id, "layer", "l2_semantic")
+		return true, ""
+	}
+
+	ep, err := s.store.GetEpisode(ctx, id)
+	if err != nil {
+		return false, fmt.Sprintf("get episode: %v", err)
+	}
+	if ep != nil {
+		if delErr := s.store.DeleteEpisode(ctx, id); delErr != nil {
+			return false, fmt.Sprintf("delete episode: %v", delErr)
+		}
+		s.logger.Info("memory_forget", "deleted_id", id, "layer", "l3_episodic")
+		return true, ""
+	}
+
+	return false, fmt.Sprintf("memory not found: %s", id)
 }
 
 func (s *Server) handleForget(ctx context.Context, _ *mcpsdk.CallToolRequest, in ForgetInput) (*mcpsdk.CallToolResult, ForgetOutput, error) {
@@ -557,39 +599,49 @@ func (s *Server) handleForget(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	}
 
 	hasID := in.ID != ""
+	hasIDs := in.IDs != nil
 	hasQuery := in.Query != ""
 
-	if hasID == hasQuery {
-		return nil, ForgetOutput{}, fmt.Errorf("exactly one of id or query must be provided")
+	// Exactly one of (ID, IDs, Query) must be set.
+	modes := 0
+	if hasID {
+		modes++
+	}
+	if hasIDs {
+		modes++
+	}
+	if hasQuery {
+		modes++
+	}
+	if modes != 1 {
+		return nil, ForgetOutput{}, fmt.Errorf("provide exactly one of id, ids, query")
+	}
+
+	// Non-nil but empty slice is a caller bug — reject.
+	if hasIDs && len(in.IDs) == 0 {
+		return nil, ForgetOutput{}, fmt.Errorf("ids must not be empty")
 	}
 
 	if hasID {
-		// Try fact first; if not found, try episode; if neither, error.
-		fact, err := s.store.GetFact(ctx, in.ID)
-		if err != nil {
-			return nil, ForgetOutput{}, fmt.Errorf("get fact: %w", err)
-		}
-		if fact != nil {
-			if delErr := s.store.DeleteFact(ctx, in.ID); delErr != nil {
-				return nil, ForgetOutput{}, fmt.Errorf("delete fact: %w", delErr)
-			}
-			s.logger.Info("memory_forget", "deleted_id", in.ID, "layer", "l2_semantic")
+		ok, reason := s.forgetOne(ctx, in.ID)
+		if ok {
 			return nil, ForgetOutput{Deleted: 1}, nil
 		}
+		return nil, ForgetOutput{}, fmt.Errorf("%s", reason)
+	}
 
-		ep, err := s.store.GetEpisode(ctx, in.ID)
-		if err != nil {
-			return nil, ForgetOutput{}, fmt.Errorf("get episode: %w", err)
-		}
-		if ep != nil {
-			if delErr := s.store.DeleteEpisode(ctx, in.ID); delErr != nil {
-				return nil, ForgetOutput{}, fmt.Errorf("delete episode: %w", delErr)
+	if hasIDs {
+		out := ForgetOutput{}
+		for _, id := range in.IDs {
+			ok, reason := s.forgetOne(ctx, id)
+			if ok {
+				out.Deleted++
+				continue
 			}
-			s.logger.Info("memory_forget", "deleted_id", in.ID, "layer", "l3_episodic")
-			return nil, ForgetOutput{Deleted: 1}, nil
+			out.Failed = append(out.Failed, ForgetFailure{ID: id, Reason: reason})
 		}
-
-		return nil, ForgetOutput{}, fmt.Errorf("memory not found: %s", in.ID)
+		s.logger.Info("memory_forget", "batch_size", len(in.IDs), "deleted", out.Deleted, "failed", len(out.Failed))
+		return nil, out, nil
 	}
 
 	// Query mode: search for candidates but do not delete.

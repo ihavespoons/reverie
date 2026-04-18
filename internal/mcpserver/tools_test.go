@@ -350,6 +350,204 @@ func TestHandleForget_NeitherIDNorQuery(t *testing.T) {
 	}
 }
 
+func TestHandleForget_BatchAllValid(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["batch one"] = []float32{0.1, 0.0, 0.0, 0.0}
+	emb.vectors["batch two"] = []float32{0.0, 0.1, 0.0, 0.0}
+	emb.vectors["batch three"] = []float32{0.0, 0.0, 0.1, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	ids := make([]string, 0, 3)
+	for _, content := range []string{"batch one", "batch two", "batch three"} {
+		_, out, err := s.handleWrite(ctx, nil, WriteInput{Content: content, Type: "project"})
+		if err != nil {
+			t.Fatalf("write %q: %v", content, err)
+		}
+		ids = append(ids, out.ID)
+	}
+
+	_, forgetOut, err := s.handleForget(ctx, nil, ForgetInput{IDs: ids})
+	if err != nil {
+		t.Fatalf("handleForget: %v", err)
+	}
+	if forgetOut.Deleted != 3 {
+		t.Fatalf("expected Deleted=3, got %d", forgetOut.Deleted)
+	}
+	if len(forgetOut.Failed) != 0 {
+		t.Fatalf("expected Failed empty, got %+v", forgetOut.Failed)
+	}
+	if len(forgetOut.Candidates) != 0 {
+		t.Fatalf("expected Candidates empty, got %+v", forgetOut.Candidates)
+	}
+
+	// Confirm all gone.
+	for _, id := range ids {
+		f, err := s.store.GetFact(ctx, id)
+		if err != nil {
+			t.Fatalf("GetFact: %v", err)
+		}
+		if f != nil {
+			t.Fatalf("expected fact %s deleted", id)
+		}
+	}
+}
+
+func TestHandleForget_BatchMixedValidAndMissing(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["keeper A"] = []float32{0.1, 0.0, 0.0, 0.0}
+	emb.vectors["keeper B"] = []float32{0.0, 0.1, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	var validIDs []string
+	for _, content := range []string{"keeper A", "keeper B"} {
+		_, out, err := s.handleWrite(ctx, nil, WriteInput{Content: content, Type: "project"})
+		if err != nil {
+			t.Fatalf("write %q: %v", content, err)
+		}
+		validIDs = append(validIDs, out.ID)
+	}
+
+	ids := []string{validIDs[0], "nonexistent-1", validIDs[1], "nonexistent-2"}
+	_, forgetOut, err := s.handleForget(ctx, nil, ForgetInput{IDs: ids})
+	if err != nil {
+		t.Fatalf("handleForget: %v", err)
+	}
+	if forgetOut.Deleted != 2 {
+		t.Fatalf("expected Deleted=2, got %d", forgetOut.Deleted)
+	}
+	if len(forgetOut.Failed) != 2 {
+		t.Fatalf("expected 2 failures, got %d: %+v", len(forgetOut.Failed), forgetOut.Failed)
+	}
+	// Both failures should name the nonexistent IDs and carry a non-empty reason.
+	seen := map[string]string{}
+	for _, f := range forgetOut.Failed {
+		seen[f.ID] = f.Reason
+	}
+	for _, missing := range []string{"nonexistent-1", "nonexistent-2"} {
+		reason, ok := seen[missing]
+		if !ok {
+			t.Fatalf("expected failure entry for %s, got %+v", missing, forgetOut.Failed)
+		}
+		if reason == "" {
+			t.Fatalf("expected non-empty reason for %s", missing)
+		}
+		if !strings.Contains(reason, "not found") {
+			t.Fatalf("expected reason for %s to mention not found, got %q", missing, reason)
+		}
+	}
+}
+
+func TestHandleForget_BatchContinuesOnMidLoopMiss(t *testing.T) {
+	// Simulate a mid-loop "store error"-class failure by including the same
+	// ID twice: the first succeeds, the second hits the not-found path.
+	emb := newStubEmbedder(4)
+	emb.vectors["target"] = []float32{0.2, 0.0, 0.0, 0.0}
+	emb.vectors["survivor"] = []float32{0.0, 0.2, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, target, err := s.handleWrite(ctx, nil, WriteInput{Content: "target", Type: "project"})
+	if err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	_, survivor, err := s.handleWrite(ctx, nil, WriteInput{Content: "survivor", Type: "project"})
+	if err != nil {
+		t.Fatalf("write survivor: %v", err)
+	}
+
+	// target listed twice; survivor must still be deleted after the middle failure.
+	_, forgetOut, err := s.handleForget(ctx, nil, ForgetInput{IDs: []string{target.ID, target.ID, survivor.ID}})
+	if err != nil {
+		t.Fatalf("handleForget: %v", err)
+	}
+	if forgetOut.Deleted != 2 {
+		t.Fatalf("expected Deleted=2 (target + survivor), got %d", forgetOut.Deleted)
+	}
+	if len(forgetOut.Failed) != 1 {
+		t.Fatalf("expected 1 failure (second target attempt), got %d: %+v", len(forgetOut.Failed), forgetOut.Failed)
+	}
+	if forgetOut.Failed[0].ID != target.ID {
+		t.Fatalf("expected failure ID %s, got %s", target.ID, forgetOut.Failed[0].ID)
+	}
+
+	// Survivor is definitely gone — proves the loop kept going past the failure.
+	f, err := s.store.GetFact(ctx, survivor.ID)
+	if err != nil {
+		t.Fatalf("GetFact: %v", err)
+	}
+	if f != nil {
+		t.Fatal("expected survivor to be deleted after mid-loop failure")
+	}
+}
+
+func TestHandleForget_BatchWithEmptyStringID(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["keeper"] = []float32{0.1, 0.0, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, keeper, err := s.handleWrite(ctx, nil, WriteInput{Content: "keeper", Type: "project"})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, out, err := s.handleForget(ctx, nil, ForgetInput{IDs: []string{"", keeper.ID}})
+	if err != nil {
+		t.Fatalf("handleForget: %v", err)
+	}
+	if out.Deleted != 1 {
+		t.Fatalf("expected Deleted=1, got %d", out.Deleted)
+	}
+	if len(out.Failed) != 1 {
+		t.Fatalf("expected 1 failure for empty id, got %+v", out.Failed)
+	}
+	if out.Failed[0].ID != "" || out.Failed[0].Reason != "empty id" {
+		t.Fatalf("expected {ID:\"\", Reason:\"empty id\"}, got %+v", out.Failed[0])
+	}
+}
+
+func TestHandleForget_BothIDAndIDs(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, err := s.handleForget(context.Background(), nil, ForgetInput{ID: "a", IDs: []string{"b"}})
+	if err == nil {
+		t.Fatal("expected error when both id and ids are provided")
+	}
+}
+
+func TestHandleForget_EmptyIDsSlice(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, err := s.handleForget(context.Background(), nil, ForgetInput{IDs: []string{}})
+	if err == nil {
+		t.Fatal("expected error for ids=[]")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("expected error to mention empty, got %v", err)
+	}
+}
+
+func TestHandleForget_IDsAndQuery(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, err := s.handleForget(context.Background(), nil, ForgetInput{IDs: []string{"a"}, Query: "q"})
+	if err == nil {
+		t.Fatal("expected error when ids and query are both provided")
+	}
+}
+
 // --- memory_list tests ---
 
 func TestHandleList_SubtypeFilter(t *testing.T) {
