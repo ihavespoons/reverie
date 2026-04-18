@@ -709,6 +709,60 @@ func (m *memStore) UpdateClusterCentroid(_ context.Context, id string, centroid 
 	return nil
 }
 
+// SetMemoryCluster updates the cluster_id of a fact (first) or an episode
+// (fallback) and bumps accessed_at. Errors "memory not found: %s" if neither
+// exists.
+func (m *memStore) SetMemoryCluster(_ context.Context, memoryID, clusterID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now().UTC()
+
+	if f, ok := m.facts[memoryID]; ok {
+		f.ClusterID = clusterID
+		f.AccessedAt = now
+		m.facts[memoryID] = f
+		return nil
+	}
+	if ep, ok := m.episodes[memoryID]; ok {
+		ep.ClusterID = clusterID
+		ep.AccessedAt = now
+		m.episodes[memoryID] = ep
+		return nil
+	}
+	return fmt.Errorf("memory not found: %s", memoryID)
+}
+
+// DeleteCluster is idempotent — a missing cluster returns nil. Refuses if any
+// non-superseded fact or any episode still references the cluster.
+func (m *memStore) DeleteCluster(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.clusters[id]; !ok {
+		return nil
+	}
+
+	factCount := 0
+	for _, f := range m.facts {
+		if f.ClusterID == id && f.SupersededBy == nil {
+			factCount++
+		}
+	}
+	episodeCount := 0
+	for _, ep := range m.episodes {
+		if ep.ClusterID == id {
+			episodeCount++
+		}
+	}
+	if factCount+episodeCount > 0 {
+		return fmt.Errorf("cluster not empty: %s (has %d facts, %d episodes)", id, factCount, episodeCount)
+	}
+
+	delete(m.clusters, id)
+	return nil
+}
+
 // --- Embedding update (for reindex) ---
 
 func (m *memStore) UpdateFactEmbedding(_ context.Context, id string, embedding []float32) error {

@@ -117,6 +117,19 @@ type Store interface {
 	// Returns an error if the cluster does not exist.
 	UpdateClusterState(ctx context.Context, id string, utility, frequency float64, turnsSince int) error
 
+	// SetMemoryCluster updates the cluster_id of the fact or episode identified
+	// by memoryID. Implementations try the fact table first, then the episode
+	// table. Returns an error ("memory not found: <id>") if neither row exists.
+	// accessed_at is bumped to time.Now().UTC() as part of the same write —
+	// reassignment is a touch.
+	SetMemoryCluster(ctx context.Context, memoryID, clusterID string) error
+
+	// DeleteCluster removes the cluster row with the given id. Returns nil
+	// (idempotent) if the cluster does not exist. Returns an error
+	// ("cluster not empty") if any non-superseded fact or any episode still
+	// references the cluster — the caller must move members first.
+	DeleteCluster(ctx context.Context, id string) error
+
 	// TickAllClusters increments turns_since by 1 for all clusters, then sets
 	// turns_since=0 for the clusters named in accessedIDs. last_access is
 	// updated to time.Now().UTC() for the accessed ones. Single transaction.

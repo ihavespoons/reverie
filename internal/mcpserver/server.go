@@ -169,6 +169,19 @@ func (s *Server) registerTools(srv *mcpsdk.Server) {
 		},
 	}, s.handleUpdateCluster)
 
+	readOnlyFalse := false
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_reassign_cluster",
+		Description: "Move a single fact or episode into a different cluster. Use this to correct auto-clustering mistakes. " +
+			"Recomputes centroids for both the old and new clusters; if the old cluster is emptied by the move, it is deleted. " +
+			"The memory's ID is preserved so supersede chains and episode links stay intact.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:  readOnlyFalse,
+			OpenWorldHint: &openWorld,
+			Title:         "Reassign memory to a cluster",
+		},
+	}, s.handleReassignCluster)
+
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name: "memory_decay_tick",
 		Description: "Advance the decay clock. Internal tool for session-end hooks and admin use. " +

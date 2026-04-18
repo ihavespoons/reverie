@@ -877,6 +877,73 @@ func (s *sqliteStore) UpdateClusterCentroid(ctx context.Context, id string, cent
 	return nil
 }
 
+// SetMemoryCluster updates the cluster_id of a fact or episode by id. The
+// fact table is tried first; if no row matches, the episode table is tried.
+// Both updates also bump accessed_at. Errors "memory not found: %s" if
+// neither table has the id.
+func (s *sqliteStore) SetMemoryCluster(ctx context.Context, memoryID, clusterID string) error {
+	now := time.Now().UTC().Format(timeFormat)
+
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE facts SET cluster_id = ?, accessed_at = ? WHERE id = ?`,
+		clusterID, now, memoryID,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite store: set memory cluster: facts: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite store: set memory cluster: facts rows affected: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+
+	res, err = s.db.ExecContext(ctx,
+		`UPDATE episodes SET cluster_id = ?, accessed_at = ? WHERE id = ?`,
+		clusterID, now, memoryID,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite store: set memory cluster: episodes: %w", err)
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite store: set memory cluster: episodes rows affected: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+
+	return fmt.Errorf("memory not found: %s", memoryID)
+}
+
+// DeleteCluster removes the cluster row with the given id. Idempotent: a
+// missing cluster returns nil. Refuses to delete if any non-superseded fact
+// or any episode still references the cluster (safety guard against
+// orphaning members via FK violation).
+func (s *sqliteStore) DeleteCluster(ctx context.Context, id string) error {
+	var factCount, episodeCount int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM facts WHERE cluster_id = ? AND superseded_by IS NULL`,
+		id,
+	).Scan(&factCount); err != nil {
+		return fmt.Errorf("sqlite store: delete cluster: count facts: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM episodes WHERE cluster_id = ?`, id,
+	).Scan(&episodeCount); err != nil {
+		return fmt.Errorf("sqlite store: delete cluster: count episodes: %w", err)
+	}
+	if factCount+episodeCount > 0 {
+		return fmt.Errorf("cluster not empty: %s (has %d facts, %d episodes)", id, factCount, episodeCount)
+	}
+
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM clusters WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("sqlite store: delete cluster: %w", err)
+	}
+	return nil
+}
+
 // --- Embedding update (for reindex) ---
 
 func (s *sqliteStore) UpdateFactEmbedding(ctx context.Context, id string, embedding []float32) error {

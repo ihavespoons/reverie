@@ -873,6 +873,119 @@ func (s *Server) handleDecayTick(ctx context.Context, _ *mcpsdk.CallToolRequest,
 	return nil, DecayTickOutput{Ticked: true}, nil
 }
 
+// --- memory_reassign_cluster ---
+
+// ReassignClusterInput is the input schema for the memory_reassign_cluster tool.
+type ReassignClusterInput struct {
+	MemoryID        string `json:"memory_id" jsonschema:"fact or episode ID"`
+	TargetClusterID string `json:"target_cluster_id" jsonschema:"destination cluster ID (must exist)"`
+}
+
+// ReassignClusterOutput is the output schema for the memory_reassign_cluster tool.
+type ReassignClusterOutput struct {
+	MemoryID          string `json:"memory_id"`
+	OldClusterID      string `json:"old_cluster_id"`
+	NewClusterID      string `json:"new_cluster_id"`
+	OldClusterDeleted bool   `json:"old_cluster_deleted"`
+}
+
+func (s *Server) handleReassignCluster(ctx context.Context, _ *mcpsdk.CallToolRequest, in ReassignClusterInput) (*mcpsdk.CallToolResult, ReassignClusterOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, ReassignClusterOutput{}, nil
+	}
+
+	if in.MemoryID == "" {
+		return nil, ReassignClusterOutput{}, fmt.Errorf("memory_id is required")
+	}
+	if in.TargetClusterID == "" {
+		return nil, ReassignClusterOutput{}, fmt.Errorf("target_cluster_id is required")
+	}
+
+	// Look up memory: fact first, then episode. Capture old cluster id.
+	var oldClusterID string
+	var layer string
+	fact, err := s.store.GetFact(ctx, in.MemoryID)
+	if err != nil {
+		return nil, ReassignClusterOutput{}, fmt.Errorf("get fact: %w", err)
+	}
+	if fact != nil {
+		oldClusterID = fact.ClusterID
+		layer = string(memory.TypeL2Semantic)
+	} else {
+		ep, getErr := s.store.GetEpisode(ctx, in.MemoryID)
+		if getErr != nil {
+			return nil, ReassignClusterOutput{}, fmt.Errorf("get episode: %w", getErr)
+		}
+		if ep == nil {
+			return nil, ReassignClusterOutput{}, fmt.Errorf("memory not found: %s", in.MemoryID)
+		}
+		oldClusterID = ep.ClusterID
+		layer = string(memory.TypeL3Episodic)
+	}
+
+	// Same-cluster reassign is a no-op error.
+	if oldClusterID == in.TargetClusterID {
+		return nil, ReassignClusterOutput{}, fmt.Errorf("memory %s already in cluster %s", in.MemoryID, in.TargetClusterID)
+	}
+
+	// Validate target cluster exists.
+	target, err := s.store.GetCluster(ctx, in.TargetClusterID)
+	if err != nil {
+		return nil, ReassignClusterOutput{}, fmt.Errorf("get target cluster: %w", err)
+	}
+	if target == nil {
+		return nil, ReassignClusterOutput{}, fmt.Errorf("cluster not found: %s", in.TargetClusterID)
+	}
+
+	// Move the memory. SetMemoryCluster bumps accessed_at as part of the write.
+	if err := s.store.SetMemoryCluster(ctx, in.MemoryID, in.TargetClusterID); err != nil {
+		return nil, ReassignClusterOutput{}, fmt.Errorf("set memory cluster: %w", err)
+	}
+
+	// Recompute centroid for the new cluster. The memory is now a member, so
+	// it will be folded into the average.
+	if err := memory.RecomputeCentroid(ctx, s.store, in.TargetClusterID); err != nil && err != memory.ErrEmptyCluster {
+		return nil, ReassignClusterOutput{}, fmt.Errorf("recompute target centroid: %w", err)
+	}
+
+	// Recompute centroid for the old cluster. If it's now empty, delete it.
+	oldDeleted := false
+	recErr := memory.RecomputeCentroid(ctx, s.store, oldClusterID)
+	switch {
+	case recErr == memory.ErrEmptyCluster:
+		if err := s.store.DeleteCluster(ctx, oldClusterID); err != nil {
+			return nil, ReassignClusterOutput{}, fmt.Errorf("delete empty old cluster: %w", err)
+		}
+		oldDeleted = true
+	case recErr != nil:
+		return nil, ReassignClusterOutput{}, fmt.Errorf("recompute old centroid: %w", recErr)
+	}
+
+	// Treat the target cluster as accessed — reset its turns_since. TickDecay
+	// increments every cluster then resets the listed ones, matching the
+	// pattern used by handleWrite after InsertFact/InsertEpisode.
+	if err := s.mgr.TickDecay(ctx, []string{in.TargetClusterID}); err != nil {
+		s.logger.Warn("memory_reassign_cluster: tick decay failed", "cluster_id", in.TargetClusterID, "err", err)
+	}
+
+	s.logger.Info("memory_reassign_cluster",
+		"memory_id", in.MemoryID,
+		"layer", layer,
+		"old_cluster_id", oldClusterID,
+		"new_cluster_id", in.TargetClusterID,
+		"old_cluster_deleted", oldDeleted,
+	)
+
+	return nil, ReassignClusterOutput{
+		MemoryID:          in.MemoryID,
+		OldClusterID:      oldClusterID,
+		NewClusterID:      in.TargetClusterID,
+		OldClusterDeleted: oldDeleted,
+	}, nil
+}
+
 // --- memory_get ---
 
 // GetInput is the input schema for the memory_get tool.

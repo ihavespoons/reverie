@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1538,4 +1539,206 @@ func idsOf(fs []Fact) []string {
 		out[i] = f.ID
 	}
 	return out
+}
+
+// --- Phase 2A: SetMemoryCluster + DeleteCluster ---
+
+func TestSQLiteSetMemoryCluster_Fact(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "target"}); err != nil {
+		t.Fatalf("CreateCluster target: %v", err)
+	}
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "source"}); err != nil {
+		t.Fatalf("CreateCluster source: %v", err)
+	}
+
+	f := testdataFacts()[0]
+	f.ClusterID = "source"
+	id, err := s.InsertFact(ctx, f)
+	if err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+
+	before, err := s.GetFact(ctx, id)
+	if err != nil {
+		t.Fatalf("GetFact before: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond) // RFC3339 has 1-second granularity
+
+	if err := s.SetMemoryCluster(ctx, id, "target"); err != nil {
+		t.Fatalf("SetMemoryCluster: %v", err)
+	}
+	after, err := s.GetFact(ctx, id)
+	if err != nil {
+		t.Fatalf("GetFact after: %v", err)
+	}
+	if after.ClusterID != "target" {
+		t.Errorf("ClusterID = %q, want target", after.ClusterID)
+	}
+	if !after.AccessedAt.After(before.AccessedAt) {
+		t.Errorf("AccessedAt not bumped: before=%v after=%v", before.AccessedAt, after.AccessedAt)
+	}
+}
+
+func TestSQLiteSetMemoryCluster_Episode(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "target"}); err != nil {
+		t.Fatalf("CreateCluster target: %v", err)
+	}
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "source"}); err != nil {
+		t.Fatalf("CreateCluster source: %v", err)
+	}
+
+	ep := testdataEpisodes()[0]
+	ep.ClusterID = "source"
+	id, err := s.InsertEpisode(ctx, ep)
+	if err != nil {
+		t.Fatalf("InsertEpisode: %v", err)
+	}
+
+	before, err := s.GetEpisode(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEpisode before: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	if err := s.SetMemoryCluster(ctx, id, "target"); err != nil {
+		t.Fatalf("SetMemoryCluster: %v", err)
+	}
+	after, err := s.GetEpisode(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEpisode after: %v", err)
+	}
+	if after.ClusterID != "target" {
+		t.Errorf("ClusterID = %q, want target", after.ClusterID)
+	}
+	if !after.AccessedAt.After(before.AccessedAt) {
+		t.Errorf("AccessedAt not bumped: before=%v after=%v", before.AccessedAt, after.AccessedAt)
+	}
+}
+
+func TestSQLiteSetMemoryCluster_NotFound(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+	err := s.SetMemoryCluster(ctx, "ghost", "anywhere")
+	if err == nil {
+		t.Fatal("expected error for missing memory")
+	}
+	if !strings.Contains(err.Error(), "memory not found: ghost") {
+		t.Errorf("error = %q, want it to contain 'memory not found: ghost'", err)
+	}
+}
+
+func TestSQLiteDeleteCluster_Empty(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "orphan"}); err != nil {
+		t.Fatalf("CreateCluster: %v", err)
+	}
+	if err := s.DeleteCluster(ctx, "orphan"); err != nil {
+		t.Fatalf("DeleteCluster: %v", err)
+	}
+	got, err := s.GetCluster(ctx, "orphan")
+	if err != nil {
+		t.Fatalf("GetCluster: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected cluster to be gone, got %+v", got)
+	}
+}
+
+func TestSQLiteDeleteCluster_Idempotent(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+	if err := s.DeleteCluster(ctx, "never-existed"); err != nil {
+		t.Errorf("DeleteCluster missing = %v, want nil", err)
+	}
+}
+
+func TestSQLiteDeleteCluster_RefusesNonEmpty(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "has-members"}); err != nil {
+		t.Fatalf("CreateCluster: %v", err)
+	}
+	f := testdataFacts()[0]
+	f.ClusterID = "has-members"
+	if _, err := s.InsertFact(ctx, f); err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+
+	err := s.DeleteCluster(ctx, "has-members")
+	if err == nil {
+		t.Fatal("expected error deleting non-empty cluster")
+	}
+	if !strings.Contains(err.Error(), "cluster not empty") {
+		t.Errorf("error = %q, want it to contain 'cluster not empty'", err)
+	}
+}
+
+// --- Phase 2A: RecomputeCentroid ---
+
+func TestSQLite_RecomputeCentroid_HappyPath(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if err := s.CreateCluster(ctx, ClusterNode{
+		ID:        "c1",
+		Centroid:  []float32{9, 9, 9, 9},
+		ItemCount: 99,
+	}); err != nil {
+		t.Fatalf("CreateCluster: %v", err)
+	}
+	f1 := Fact{Content: "a", Subtype: "project", ClusterID: "c1", Embedding: []float32{1, 0, 0, 0}}
+	f2 := Fact{Content: "b", Subtype: "project", ClusterID: "c1", Embedding: []float32{0, 1, 0, 0}}
+	ep := Episode{Situation: "sit", Action: "act", Outcome: "out", Preemptive: "p", ClusterID: "c1", Embedding: []float32{0, 0, 1, 0}}
+	if _, err := s.InsertFact(ctx, f1); err != nil {
+		t.Fatalf("InsertFact f1: %v", err)
+	}
+	if _, err := s.InsertFact(ctx, f2); err != nil {
+		t.Fatalf("InsertFact f2: %v", err)
+	}
+	if _, err := s.InsertEpisode(ctx, ep); err != nil {
+		t.Fatalf("InsertEpisode: %v", err)
+	}
+
+	if err := RecomputeCentroid(ctx, s, "c1"); err != nil {
+		t.Fatalf("RecomputeCentroid: %v", err)
+	}
+	got, err := s.GetCluster(ctx, "c1")
+	if err != nil {
+		t.Fatalf("GetCluster: %v", err)
+	}
+	want := []float32{1.0 / 3, 1.0 / 3, 1.0 / 3, 0}
+	if len(got.Centroid) != len(want) {
+		t.Fatalf("centroid len = %d, want %d", len(got.Centroid), len(want))
+	}
+	const eps = 1e-6
+	for i := range want {
+		diff := float64(got.Centroid[i] - want[i])
+		if diff < -eps || diff > eps {
+			t.Errorf("centroid[%d] = %v, want %v", i, got.Centroid[i], want[i])
+		}
+	}
+	if got.ItemCount != 3 {
+		t.Errorf("ItemCount = %d, want 3", got.ItemCount)
+	}
+}
+
+func TestSQLite_RecomputeCentroid_EmptyCluster(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "empty"}); err != nil {
+		t.Fatalf("CreateCluster: %v", err)
+	}
+	err := RecomputeCentroid(ctx, s, "empty")
+	if err != ErrEmptyCluster {
+		t.Fatalf("RecomputeCentroid empty = %v, want ErrEmptyCluster", err)
+	}
 }

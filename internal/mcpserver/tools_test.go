@@ -2,9 +2,12 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"personal/reverie/internal/cluster"
 	"personal/reverie/internal/config"
@@ -2352,4 +2355,329 @@ func TestHandleGet_LinksBidirectional(t *testing.T) {
 	if len(eGet.Links) != 1 || eGet.Links[0].ID != fOut.ID || eGet.Links[0].Layer != "l2_semantic" {
 		t.Errorf("episode links = %+v, want one link to %s (l2_semantic)", eGet.Links, fOut.ID)
 	}
+}
+
+// --- memory_reassign_cluster tests ---
+
+// seedTwoClusters writes two facts with orthogonal embeddings (cosine=0), which
+// is below the assigner's 0.60 threshold, so each fact lands in its own cluster.
+// Returns (factAID, clusterA, factBID, clusterB).
+func seedTwoClusters(t *testing.T, s *Server, emb *stubEmbedder) (string, string, string, string) {
+	t.Helper()
+	ctx := context.Background()
+
+	emb.vectors["fact a"] = []float32{1, 0, 0, 0}
+	emb.vectors["fact b"] = []float32{0, 1, 0, 0}
+
+	_, aOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact a", Type: "project"})
+	if err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	_, bOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact b", Type: "project"})
+	if err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+
+	fa, err := s.store.GetFact(ctx, aOut.ID)
+	if err != nil || fa == nil {
+		t.Fatalf("GetFact a: %v", err)
+	}
+	fb, err := s.store.GetFact(ctx, bOut.ID)
+	if err != nil || fb == nil {
+		t.Fatalf("GetFact b: %v", err)
+	}
+	if fa.ClusterID == fb.ClusterID {
+		t.Fatalf("expected separate clusters for orthogonal facts; both in %s", fa.ClusterID)
+	}
+	return aOut.ID, fa.ClusterID, bOut.ID, fb.ClusterID
+}
+
+func TestHandleReassignCluster_Fact(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	// Seed three facts: two in cluster A (so moving one doesn't empty it), one in cluster B.
+	// Use different subtypes for a1 and a2 so conflict detection (which filters by
+	// subtype) doesn't supersede one with the other despite their near-identical embeddings.
+	emb.vectors["fact a1"] = []float32{1, 0, 0, 0}
+	emb.vectors["fact a2"] = []float32{0.99, 0.01, 0, 0} // very similar to a1
+	emb.vectors["fact b"] = []float32{0, 1, 0, 0}
+
+	_, a1Out, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact a1", Type: "project"})
+	if err != nil {
+		t.Fatalf("write a1: %v", err)
+	}
+	_, a2Out, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact a2", Type: "user"})
+	if err != nil {
+		t.Fatalf("write a2: %v", err)
+	}
+	_, bOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact b", Type: "project"})
+	if err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+
+	a1, _ := s.store.GetFact(ctx, a1Out.ID)
+	a2, _ := s.store.GetFact(ctx, a2Out.ID)
+	b, _ := s.store.GetFact(ctx, bOut.ID)
+	if a1.ClusterID != a2.ClusterID {
+		t.Fatalf("expected a1,a2 in same cluster; got %q and %q", a1.ClusterID, a2.ClusterID)
+	}
+	if a1.ClusterID == b.ClusterID {
+		t.Fatalf("expected b in separate cluster; all in %s", a1.ClusterID)
+	}
+
+	clusterA := a1.ClusterID
+	clusterB := b.ClusterID
+
+	// Grab centroids before the move for a before/after comparison.
+	preA, _ := s.store.GetCluster(ctx, clusterA)
+	preB, _ := s.store.GetCluster(ctx, clusterB)
+	preAccess := a1.AccessedAt
+	time.Sleep(2 * time.Millisecond)
+
+	_, out, err := s.handleReassignCluster(ctx, nil, ReassignClusterInput{
+		MemoryID:        a1Out.ID,
+		TargetClusterID: clusterB,
+	})
+	if err != nil {
+		t.Fatalf("handleReassignCluster: %v", err)
+	}
+	if out.OldClusterID != clusterA {
+		t.Errorf("OldClusterID = %q, want %q", out.OldClusterID, clusterA)
+	}
+	if out.NewClusterID != clusterB {
+		t.Errorf("NewClusterID = %q, want %q", out.NewClusterID, clusterB)
+	}
+	if out.OldClusterDeleted {
+		t.Errorf("OldClusterDeleted = true, want false (clusterA still has a2)")
+	}
+
+	// Fact is now in clusterB.
+	a1Post, err := s.store.GetFact(ctx, a1Out.ID)
+	if err != nil {
+		t.Fatalf("GetFact a1: %v", err)
+	}
+	if a1Post.ClusterID != clusterB {
+		t.Errorf("a1.ClusterID = %q, want %q", a1Post.ClusterID, clusterB)
+	}
+	if !a1Post.AccessedAt.After(preAccess) {
+		t.Errorf("accessed_at not bumped: before=%v after=%v", preAccess, a1Post.AccessedAt)
+	}
+
+	// Both centroids should have been recomputed — they differ from the pre-move values.
+	postA, _ := s.store.GetCluster(ctx, clusterA)
+	postB, _ := s.store.GetCluster(ctx, clusterB)
+	if postA == nil {
+		t.Fatal("clusterA was deleted but it still has a2")
+	}
+	if postB == nil {
+		t.Fatal("clusterB missing after reassign")
+	}
+	// ClusterA now has one member (a2); centroid equals a2's embedding.
+	if postA.ItemCount != 1 {
+		t.Errorf("clusterA ItemCount = %d, want 1", postA.ItemCount)
+	}
+	if vectorsEqual(postA.Centroid, preA.Centroid) {
+		t.Errorf("clusterA centroid unchanged after reassign: %v", postA.Centroid)
+	}
+	// ClusterB now has two members (b, a1); centroid should equal the average of their embeddings.
+	if postB.ItemCount != 2 {
+		t.Errorf("clusterB ItemCount = %d, want 2", postB.ItemCount)
+	}
+	if vectorsEqual(postB.Centroid, preB.Centroid) {
+		t.Errorf("clusterB centroid unchanged after reassign: %v", postB.Centroid)
+	}
+}
+
+func TestHandleReassignCluster_Episode(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	// Two unrelated episodes → two clusters.
+	emb.vectors["sitA\nactA\noutA\npA"] = []float32{1, 0, 0, 0}
+	emb.vectors["sitB\nactB\noutB\npB"] = []float32{0, 1, 0, 0}
+	// An extra episode in cluster A so it doesn't disappear on reassign.
+	emb.vectors["sitA2\nactA2\noutA2\npA2"] = []float32{0.99, 0.01, 0, 0}
+
+	_, a1, err := s.handleWrite(ctx, nil, WriteInput{Type: "feedback", Episode: &EpisodePayload{
+		Situation: "sitA", Action: "actA", Outcome: "outA", Preemptive: "pA",
+	}})
+	if err != nil {
+		t.Fatalf("write a1: %v", err)
+	}
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{Type: "feedback", Episode: &EpisodePayload{
+		Situation: "sitA2", Action: "actA2", Outcome: "outA2", Preemptive: "pA2",
+	}})
+	if err != nil {
+		t.Fatalf("write a2: %v", err)
+	}
+	_, b1, err := s.handleWrite(ctx, nil, WriteInput{Type: "feedback", Episode: &EpisodePayload{
+		Situation: "sitB", Action: "actB", Outcome: "outB", Preemptive: "pB",
+	}})
+	if err != nil {
+		t.Fatalf("write b1: %v", err)
+	}
+
+	ea1, _ := s.store.GetEpisode(ctx, a1.ID)
+	eb1, _ := s.store.GetEpisode(ctx, b1.ID)
+	if ea1.ClusterID == eb1.ClusterID {
+		t.Fatalf("expected distinct clusters, both in %s", ea1.ClusterID)
+	}
+	clusterA := ea1.ClusterID
+	clusterB := eb1.ClusterID
+
+	_, out, err := s.handleReassignCluster(ctx, nil, ReassignClusterInput{
+		MemoryID:        a1.ID,
+		TargetClusterID: clusterB,
+	})
+	if err != nil {
+		t.Fatalf("handleReassignCluster: %v", err)
+	}
+	if out.NewClusterID != clusterB || out.OldClusterID != clusterA {
+		t.Errorf("unexpected out: %+v", out)
+	}
+	post, _ := s.store.GetEpisode(ctx, a1.ID)
+	if post.ClusterID != clusterB {
+		t.Errorf("episode cluster = %q, want %q", post.ClusterID, clusterB)
+	}
+}
+
+func TestHandleReassignCluster_SameCluster(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	aID, clusterA, _, _ := seedTwoClusters(t, s, emb)
+
+	_, _, err := s.handleReassignCluster(context.Background(), nil, ReassignClusterInput{
+		MemoryID:        aID,
+		TargetClusterID: clusterA,
+	})
+	if err == nil {
+		t.Fatal("expected error for same-cluster reassign")
+	}
+	want := "memory " + aID + " already in cluster " + clusterA
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestHandleReassignCluster_TargetNotFound(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	aID, _, _, _ := seedTwoClusters(t, s, emb)
+
+	_, _, err := s.handleReassignCluster(context.Background(), nil, ReassignClusterInput{
+		MemoryID:        aID,
+		TargetClusterID: "ghost-cluster",
+	})
+	if err == nil {
+		t.Fatal("expected error for missing target cluster")
+	}
+	if !strings.Contains(err.Error(), "cluster not found: ghost-cluster") {
+		t.Errorf("error = %q, want it to contain 'cluster not found: ghost-cluster'", err)
+	}
+}
+
+func TestHandleReassignCluster_MemoryNotFound(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	// Still need a target cluster — create one by writing a fact.
+	_, _, _, clusterB := seedTwoClusters(t, s, emb)
+
+	_, _, err := s.handleReassignCluster(context.Background(), nil, ReassignClusterInput{
+		MemoryID:        "ghost-memory",
+		TargetClusterID: clusterB,
+	})
+	if err == nil {
+		t.Fatal("expected error for missing memory")
+	}
+	if !strings.Contains(err.Error(), "memory not found: ghost-memory") {
+		t.Errorf("error = %q, want it to contain 'memory not found: ghost-memory'", err)
+	}
+}
+
+func TestHandleReassignCluster_LastMemberDeletesOldCluster(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	aID, clusterA, _, clusterB := seedTwoClusters(t, s, emb)
+
+	_, out, err := s.handleReassignCluster(context.Background(), nil, ReassignClusterInput{
+		MemoryID:        aID,
+		TargetClusterID: clusterB,
+	})
+	if err != nil {
+		t.Fatalf("handleReassignCluster: %v", err)
+	}
+	if !out.OldClusterDeleted {
+		t.Errorf("OldClusterDeleted = false, want true (clusterA had only one member)")
+	}
+	// Old cluster row should be gone.
+	ctx := context.Background()
+	cl, err := s.store.GetCluster(ctx, clusterA)
+	if err != nil {
+		t.Fatalf("GetCluster: %v", err)
+	}
+	if cl != nil {
+		t.Errorf("expected clusterA deleted, still present: %+v", cl)
+	}
+}
+
+func TestHandleReassignCluster_LastMemberRemovedFromL1Index(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	aID, clusterA, _, clusterB := seedTwoClusters(t, s, emb)
+
+	ctx := context.Background()
+	_, _, err := s.handleReassignCluster(ctx, nil, ReassignClusterInput{
+		MemoryID:        aID,
+		TargetClusterID: clusterB,
+	})
+	if err != nil {
+		t.Fatalf("handleReassignCluster: %v", err)
+	}
+
+	// Pull l1/index and verify clusterA is absent.
+	req := &mcpsdk.ReadResourceRequest{}
+	req.Params = &mcpsdk.ReadResourceParams{URI: "reverie://l1/index"}
+	res, err := s.handleL1IndexResource(ctx, req)
+	if err != nil {
+		t.Fatalf("handleL1IndexResource: %v", err)
+	}
+	var index l1IndexResponse
+	if err := json.Unmarshal([]byte(res.Contents[0].Text), &index); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, cl := range index.Clusters {
+		if cl.ID == clusterA {
+			t.Errorf("l1/index still lists deleted clusterA: %+v", cl)
+		}
+	}
+}
+
+// vectorsEqual reports whether two float32 slices are exactly equal.
+func vectorsEqual(a, b []float32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
