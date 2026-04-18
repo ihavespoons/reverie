@@ -1,0 +1,118 @@
+# Reverie — MCP memory server configuration.
+# Copy to ~/.config/reverie/reverie.toml and adjust as needed.
+# Environment variables override values in this file where noted.
+
+[storage]
+# Path to the SQLite database file. Supports ~/ expansion.
+# Override: REVERIE_DB_PATH
+db_path = "~/.local/share/reverie/reverie.db"
+
+[memory]
+# Number of recent conversation turns kept in the sliding window.
+sliding_window_k = 20
+
+# Maximum number of L2/L3 memory refs in the working memory buffer.
+cache_budget_max = 50
+
+# Cosine similarity threshold for Gate B (similarity gate).
+# Candidates below this score are filtered out during recall.
+similarity_threshold = 0.70
+
+# Ebbinghaus retention threshold for Gate C (retention gate).
+# Candidates with retention below this are filtered out during recall.
+retention_threshold = 0.30
+
+# Cosine similarity above which a new fact is considered a conflict with an
+# existing fact of the same subtype (temporal conflict resolution on write).
+conflict_threshold = 0.92
+
+[decay]
+# Temperature (T) controls how slowly memories fade. Higher values make decay
+# more gradual — a cluster needs more idle turns before its retention drops
+# below the threshold. The formula: S = (U + F + 0.01) * T, then R = exp(-n/S).
+# At T=10, a cold-start cluster (U=F=0.5) has S=10.1 and drops below the
+# default retention_threshold=0.30 after ~12 turns. Increase T if you find
+# useful memories are being forgotten too quickly; decrease it if stale
+# memories dominate recall results.
+temperature = 10.0
+
+# Utility learning rate (alpha). Controls how fast the utility score U_t(c)
+# responds to reinforcement. U is updated via exponential moving average:
+# U_{t+1} = alpha * signal + (1 - alpha) * U_t. Higher alpha means faster
+# adaptation but more noise; lower alpha means smoother but slower learning.
+utility_alpha = 0.10
+
+# Frequency learning rate (beta). Controls how fast F_t(c) responds to
+# access frequency. Same EMA update rule as utility. Kept separate so that
+# access-count signals can be weighted differently from explicit reinforcement.
+frequency_beta = 0.05
+
+# Cold-start utility for newly created clusters. Setting this to 0 would give
+# new clusters a stability of only epsilon*T = 0.1 — they would decay below
+# the retention threshold in a single turn before the agent has a chance to
+# reinforce them. The default 0.5 gives S = 10.1 (with T=10), providing a
+# ~12-turn grace period.
+cold_start_utility = 0.5
+
+# Cold-start frequency for newly created clusters. Same rationale as
+# cold_start_utility — prevents instant decay of fresh memories.
+cold_start_frequency = 0.5
+
+[embedding]
+# Embedding provider.
+#   "openai_compat" — any OpenAI-compatible /v1/embeddings endpoint.
+#                      Works with Ollama, LM Studio, real OpenAI, etc.
+#                      (default — local via Ollama)
+#   "voyage"        — Voyage AI hosted API (requires VOYAGE_API_KEY).
+provider = "openai_compat"
+
+# Base URL for openai_compat. Include the /v1 suffix.
+#   Ollama:    http://localhost:11434/v1
+#   LM Studio: http://localhost:1234/v1
+#   OpenAI:    https://api.openai.com/v1
+# Override: REVERIE_EMBED_URL
+base_url = "http://localhost:11434/v1"
+
+# Model identifier.
+#   nomic-embed-text   — 768-dim, fast, ~274 MB   (default)
+#   mxbai-embed-large  — 1024-dim, stronger, ~670 MB
+#   bge-m3             — 1024-dim, multilingual, ~1 GB
+#   voyage-3           — 1024-dim (only with provider = "voyage")
+# Override: REVERIE_EMBED_MODEL
+model = "nomic-embed-text"
+
+# Maximum number of texts to embed in a single API request.
+batch_size = 32
+
+# Advisory embedding dimensionality. Must match the model's actual output.
+# Warning: changing this after facts are stored breaks similarity search.
+# Wipe the database and re-embed if you change models.
+dimensions = 768
+
+# API key source:
+#   openai_compat → OPENAI_API_KEY (optional; Ollama and LM Studio ignore it)
+#   voyage        → VOYAGE_API_KEY (required)
+# Never read from this file for security.
+
+[cluster]
+# Minimum cosine similarity to assign a fact to an existing cluster.
+# Below this threshold, a new cluster is created.
+min_similarity_for_assignment = 0.60
+
+# Maximum number of L1 clusters allowed.
+max_clusters = 100
+
+[server]
+# Seconds of inactivity before triggering session consolidation.
+inactivity_consolidate_seconds = 300
+
+# How long (seconds) a recall_id remains valid for memory_apply_judgment.
+recall_cache_ttl_seconds = 300
+
+# Log level: "debug", "info", "warn", "error".
+# Override: REVERIE_LOG_LEVEL
+log_level = "info"
+
+# Set to true to disable all tools (they return {status: "disabled"}).
+# Override: REVERIE_DISABLED=1
+disabled = false

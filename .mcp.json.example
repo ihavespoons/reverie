@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "reverie": {
+      "type": "stdio",
+      "command": "go",
+      "args": ["run", "./cmd/reverie", "serve"]
+    }
+  }
+}

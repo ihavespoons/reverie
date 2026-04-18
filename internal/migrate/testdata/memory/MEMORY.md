@@ -1,0 +1,2 @@
+- [User context](user_context.md) -- user info
+- [Project goals](project_goals.md) -- project description

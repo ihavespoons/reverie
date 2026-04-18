@@ -1,0 +1,148 @@
+package memory
+
+import "context"
+
+// Store defines the persistence interface for the reverie memory system.
+// It covers L2 fact operations, L3 episode operations, cross-type links,
+// cluster management, temporal conflict resolution, and brute-force cosine search.
+type Store interface {
+	// --- L2 Fact operations ---
+
+	// InsertFact persists a new L2 semantic fact and returns its assigned ID.
+	// The fact's Embedding field should already be populated before insertion.
+	// If a fact with the same ContentHash already exists and is not superseded,
+	// implementations should return the existing ID (idempotency).
+	// If fact.ClusterID is empty, the default cluster is used.
+	InsertFact(ctx context.Context, f Fact) (id string, err error)
+
+	// GetFact retrieves a single fact by its ID. Returns nil and no error if
+	// the fact does not exist.
+	GetFact(ctx context.Context, id string) (*Fact, error)
+
+	// DeleteFact removes a fact by ID. Returns no error if the fact does not
+	// exist (idempotent delete).
+	DeleteFact(ctx context.Context, id string) error
+
+	// ListFacts returns facts matching the given filter criteria, ordered by
+	// the filter's Sort field. Use this for browsing/audit via memory_list.
+	// Superseded facts are excluded.
+	ListFacts(ctx context.Context, filter ListFilter) ([]Fact, error)
+
+	// --- L3 Episode operations ---
+
+	// InsertEpisode persists a new L3 episodic memory and returns its assigned ID.
+	// If episode.ClusterID is empty, the default cluster is used.
+	InsertEpisode(ctx context.Context, e Episode) (id string, err error)
+
+	// GetEpisode retrieves a single episode by its ID. Returns nil and no error
+	// if the episode does not exist.
+	GetEpisode(ctx context.Context, id string) (*Episode, error)
+
+	// DeleteEpisode removes an episode by ID. Returns no error if the episode
+	// does not exist (idempotent delete). Associated fact_episode_links are
+	// cascade-deleted.
+	DeleteEpisode(ctx context.Context, id string) error
+
+	// ListEpisodes returns episodes matching the given filter criteria, ordered
+	// by the filter's Sort field. The Subtype field of ListFilter is ignored
+	// for episodes (episodes do not have subtypes); all other fields apply.
+	ListEpisodes(ctx context.Context, filter ListFilter) ([]Episode, error)
+
+	// --- Fact <-> Episode cross-type links ---
+
+	// LinkFactEpisode creates a link between a fact and an episode with the given
+	// link type (e.g. "evidence"). Duplicate links are silently ignored.
+	LinkFactEpisode(ctx context.Context, factID, episodeID, linkType string) error
+
+	// GetFactLinks returns the episodes linked to the given fact, eager-loaded
+	// via a single JOIN query.
+	GetFactLinks(ctx context.Context, factID string) ([]EpisodeLink, error)
+
+	// GetEpisodeLinks returns the facts linked to the given episode, eager-loaded
+	// via a single JOIN query.
+	GetEpisodeLinks(ctx context.Context, episodeID string) ([]FactLink, error)
+
+	// --- Search ---
+
+	// GlobalSearch performs a brute-force cosine similarity search across all
+	// L2 facts and L3 episodes. It returns the top `limit` candidates
+	// ranked by descending similarity to queryVec. Superseded facts are excluded.
+	GlobalSearch(ctx context.Context, queryVec []float32, limit int) ([]Candidate, error)
+
+	// TouchAccessed updates the accessed_at timestamp for the given memory IDs
+	// to the current time. Works for both facts and episodes.
+	TouchAccessed(ctx context.Context, ids []string) error
+
+	// --- Cluster operations ---
+
+	// GetCluster returns the cluster with the given id, or (nil, nil) if not found.
+	GetCluster(ctx context.Context, id string) (*ClusterNode, error)
+
+	// ListClusters returns all clusters ordered by id. On a fresh store with no
+	// facts inserted, this returns an empty slice.
+	ListClusters(ctx context.Context) ([]ClusterNode, error)
+
+	// CreateCluster persists a new cluster node. Returns an error if a cluster
+	// with the same ID already exists.
+	CreateCluster(ctx context.Context, c ClusterNode) error
+
+	// UpdateClusterCentroid updates the centroid vector and item count for the
+	// cluster with the given ID. Returns an error if the cluster does not exist.
+	UpdateClusterCentroid(ctx context.Context, id string, centroid []float32, itemCount int) error
+
+	// UpdateClusterMeta sets the summary, domain, and meta_instr fields for a cluster.
+	// Returns an error if the cluster does not exist.
+	UpdateClusterMeta(ctx context.Context, id string, summary, domain, metaInstr string) error
+
+	// UpdateClusterState writes the utility, frequency, and turnsSince fields for
+	// the cluster atomically. LastAccess is updated to time.Now().UTC().
+	// Returns an error if the cluster does not exist.
+	UpdateClusterState(ctx context.Context, id string, utility, frequency float64, turnsSince int) error
+
+	// TickAllClusters increments turns_since by 1 for all clusters, then sets
+	// turns_since=0 for the clusters named in accessedIDs. last_access is
+	// updated to time.Now().UTC() for the accessed ones. Single transaction.
+	TickAllClusters(ctx context.Context, accessedIDs []string) error
+
+	// --- Embedding update (for reindex) ---
+
+	// UpdateFactEmbedding replaces the embedding vector for a fact.
+	// Used by reindex after switching embedding models.
+	UpdateFactEmbedding(ctx context.Context, id string, embedding []float32) error
+
+	// UpdateEpisodeEmbedding replaces the embedding vector for an episode.
+	// Used by reindex after switching embedding models.
+	UpdateEpisodeEmbedding(ctx context.Context, id string, embedding []float32) error
+
+	// --- Temporal conflict resolution ---
+
+	// SupersedeFact sets the superseded_by field of the old fact to point to the
+	// new fact. Returns an error if the old fact does not exist.
+	SupersedeFact(ctx context.Context, oldID, newID string) error
+
+	// FindSimilarFacts returns non-superseded facts of the given subtype whose
+	// embedding has cosine similarity >= threshold to queryVec. Results are
+	// ordered by descending similarity and capped at limit.
+	FindSimilarFacts(ctx context.Context, subtype string, queryVec []float32, threshold float32, limit int) ([]Candidate, error)
+
+	// Close releases any resources held by the store (e.g., database connections).
+	Close() error
+}
+
+// ListFilter specifies criteria for listing facts and episodes.
+type ListFilter struct {
+	// Subtype filters by the auto-memory taxonomy classification.
+	// If nil, all subtypes are returned. Ignored for episode listings
+	// (episodes do not have subtypes).
+	Subtype *string `json:"subtype"`
+
+	// Limit caps the number of results. Zero means implementation default.
+	Limit int `json:"limit"`
+
+	// Offset skips the first N results (for pagination).
+	Offset int `json:"offset"`
+
+	// Sort determines ordering: "created" (by created_at) or "accessed" (by accessed_at).
+	// Empty string defaults to "created".
+	Sort string `json:"sort"`
+}
