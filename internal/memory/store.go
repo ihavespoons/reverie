@@ -48,6 +48,24 @@ type Store interface {
 	// for episodes (episodes do not have subtypes); all other fields apply.
 	ListEpisodes(ctx context.Context, filter ListFilter) ([]Episode, error)
 
+	// ListFactsByCluster returns non-superseded facts in the given cluster,
+	// ordered by created_at ascending (oldest first — stable for pagination).
+	// limit/offset control the page window. A negative limit is clamped to 0.
+	ListFactsByCluster(ctx context.Context, clusterID string, limit, offset int) ([]Fact, error)
+
+	// ListEpisodesByCluster returns episodes in the given cluster, ordered by
+	// created_at ascending (oldest first — stable for pagination). limit/offset
+	// control the page window. A negative limit is clamped to 0.
+	ListEpisodesByCluster(ctx context.Context, clusterID string, limit, offset int) ([]Episode, error)
+
+	// CountFactsByCluster returns the total number of non-superseded facts in
+	// the given cluster (used for paginated membership responses).
+	CountFactsByCluster(ctx context.Context, clusterID string) (int, error)
+
+	// CountEpisodesByCluster returns the total number of episodes in the given
+	// cluster (used for paginated membership responses).
+	CountEpisodesByCluster(ctx context.Context, clusterID string) (int, error)
+
 	// --- Fact <-> Episode cross-type links ---
 
 	// LinkFactEpisode creates a link between a fact and an episode with the given

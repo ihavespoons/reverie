@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
+	"strconv"
+	"strings"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -33,6 +36,13 @@ func (s *Server) registerResources(srv *mcpsdk.Server) {
 		Description: "Last 10 L3 episodic memories by creation time. Use for 'what did we do last time' queries.",
 		MIMEType:    "application/json",
 	}, s.handleL3RecentResource)
+
+	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+		URITemplate: "reverie://l1/cluster/{id}{?limit,offset}",
+		Name:        "L1 Cluster Detail",
+		Description: "Per-cluster detail view — cluster metadata plus a paginated list of members (facts and episodes). Members are ordered by created_at ascending. Query params: limit (default 50, max 200), offset (default 0).",
+		MIMEType:    "application/json",
+	}, s.handleL1ClusterDetailResource)
 }
 
 // --- reverie://status ---
@@ -165,6 +175,202 @@ func (s *Server) handleL1IndexResource(ctx context.Context, req *mcpsdk.ReadReso
 		return nil, fmt.Errorf("l1 index: marshal: %w", err)
 	}
 
+	return &mcpsdk.ReadResourceResult{
+		Contents: []*mcpsdk.ResourceContents{{
+			URI:      req.Params.URI,
+			MIMEType: "application/json",
+			Text:     string(data),
+		}},
+	}, nil
+}
+
+// --- reverie://l1/cluster/{id} ---
+
+const (
+	clusterDetailDefaultLimit = 50
+	clusterDetailMaxLimit     = 200
+)
+
+// l1ClusterDetailResponse is the JSON structure for the per-cluster detail
+// resource: cluster metadata (same shape as an l1/index entry) plus a
+// paginated list of members.
+type l1ClusterDetailResponse struct {
+	Cluster l1ClusterEntry    `json:"cluster"`
+	Members []l1ClusterMember `json:"members"`
+	Total   int               `json:"total"`
+	Limit   int               `json:"limit"`
+	Offset  int               `json:"offset"`
+}
+
+type l1ClusterMember struct {
+	ID         string   `json:"id"`
+	Layer      string   `json:"layer"`
+	Subtype    string   `json:"subtype,omitempty"`
+	Content    string   `json:"content"`
+	Tags       []string `json:"tags,omitempty"`
+	CreatedAt  string   `json:"created_at"`
+	AccessedAt string   `json:"accessed_at"`
+}
+
+// parseClusterDetailURI extracts the cluster id and optional limit/offset from
+// a reverie://l1/cluster/{id}[?limit=N&offset=N] URI.
+func parseClusterDetailURI(raw string) (id string, limit, offset int, err error) {
+	u, perr := url.Parse(raw)
+	if perr != nil {
+		return "", 0, 0, fmt.Errorf("invalid uri: %w", perr)
+	}
+
+	// Path layout: "/cluster/{id}". The host is "l1".
+	const prefix = "/cluster/"
+	if !strings.HasPrefix(u.Path, prefix) {
+		return "", 0, 0, fmt.Errorf("invalid uri path: %q", u.Path)
+	}
+	id = strings.TrimPrefix(u.Path, prefix)
+	id = strings.Trim(id, "/")
+	if id == "" {
+		return "", 0, 0, fmt.Errorf("cluster id is required")
+	}
+
+	limit = clusterDetailDefaultLimit
+	if raw := u.Query().Get("limit"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			return "", 0, 0, fmt.Errorf("invalid limit: %q", raw)
+		}
+		limit = v
+	}
+	if limit > clusterDetailMaxLimit {
+		limit = clusterDetailMaxLimit
+	}
+
+	offset = 0
+	if raw := u.Query().Get("offset"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			return "", 0, 0, fmt.Errorf("invalid offset: %q", raw)
+		}
+		offset = v
+	}
+
+	return id, limit, offset, nil
+}
+
+// truncateContent truncates s to max runes and appends an ellipsis if truncated.
+func truncateContent(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max])
+}
+
+// renderEpisodeContent is the canonical single-string rendering of an episode
+// used by memory_list / memory_recall / memory_get. Kept local to keep the
+// resource handler self-contained.
+func renderEpisodeContent(ep memory.Episode) string {
+	return memory.Candidate{Episode: &ep}.Content()
+}
+
+func (s *Server) handleL1ClusterDetailResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
+	id, limit, offset, err := parseClusterDetailURI(req.Params.URI)
+	if err != nil {
+		return nil, fmt.Errorf("l1 cluster detail: %w", err)
+	}
+
+	cluster, err := s.store.GetCluster(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("l1 cluster detail: get cluster: %w", err)
+	}
+	if cluster == nil {
+		return nil, fmt.Errorf("cluster not found: %s", id)
+	}
+
+	factCount, err := s.store.CountFactsByCluster(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("l1 cluster detail: count facts: %w", err)
+	}
+	epCount, err := s.store.CountEpisodesByCluster(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("l1 cluster detail: count episodes: %w", err)
+	}
+	total := factCount + epCount
+
+	// We paginate across the union of (facts ∪ episodes) ordered by created_at
+	// ASC. To avoid loading everything, walk facts first in the requested
+	// window; if the window extends into episodes, pull the remainder from
+	// the episodes page. A fully-in-facts or fully-in-episodes request only
+	// touches one side.
+	members := make([]l1ClusterMember, 0, limit)
+	if limit > 0 {
+		if offset < factCount {
+			take := limit
+			if offset+take > factCount {
+				take = factCount - offset
+			}
+			facts, err := s.store.ListFactsByCluster(ctx, id, take, offset)
+			if err != nil {
+				return nil, fmt.Errorf("l1 cluster detail: list facts: %w", err)
+			}
+			for _, f := range facts {
+				members = append(members, l1ClusterMember{
+					ID:         f.ID,
+					Layer:      string(memory.TypeL2Semantic),
+					Subtype:    f.Subtype,
+					Content:    truncateContent(f.Content, 200),
+					Tags:       normalizeTagsSlice(f.Tags),
+					CreatedAt:  f.CreatedAt.Format("2006-01-02T15:04:05Z"),
+					AccessedAt: f.AccessedAt.Format("2006-01-02T15:04:05Z"),
+				})
+			}
+		}
+
+		if len(members) < limit {
+			epOffset := offset - factCount
+			if epOffset < 0 {
+				epOffset = 0
+			}
+			epLimit := limit - len(members)
+			if epLimit > 0 && epOffset < epCount {
+				episodes, err := s.store.ListEpisodesByCluster(ctx, id, epLimit, epOffset)
+				if err != nil {
+					return nil, fmt.Errorf("l1 cluster detail: list episodes: %w", err)
+				}
+				for _, ep := range episodes {
+					members = append(members, l1ClusterMember{
+						ID:         ep.ID,
+						Layer:      string(memory.TypeL3Episodic),
+						Content:    truncateContent(renderEpisodeContent(ep), 200),
+						Tags:       normalizeTagsSlice(ep.Tags),
+						CreatedAt:  ep.CreatedAt.Format("2006-01-02T15:04:05Z"),
+						AccessedAt: ep.AccessedAt.Format("2006-01-02T15:04:05Z"),
+					})
+				}
+			}
+		}
+	}
+
+	resp := l1ClusterDetailResponse{
+		Cluster: l1ClusterEntry{
+			ID:         cluster.ID,
+			Summary:    cluster.Summary,
+			Domain:     cluster.Domain,
+			MetaInstr:  cluster.MetaInstr,
+			ItemCount:  cluster.ItemCount,
+			Utility:    cluster.Utility,
+			Frequency:  cluster.Frequency,
+			TurnsSince: cluster.TurnsSince,
+			Retention:  s.decayer.Retention(*cluster),
+		},
+		Members: members,
+		Total:   total,
+		Limit:   limit,
+		Offset:  offset,
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return nil, fmt.Errorf("l1 cluster detail: marshal: %w", err)
+	}
 	return &mcpsdk.ReadResourceResult{
 		Contents: []*mcpsdk.ResourceContents{{
 			URI:      req.Params.URI,

@@ -613,6 +613,96 @@ func (s *sqliteStore) ListEpisodes(ctx context.Context, filter ListFilter) ([]Ep
 	return episodes, nil
 }
 
+// --- Cluster membership (paginated) ---
+
+func (s *sqliteStore) ListFactsByCluster(ctx context.Context, clusterID string, limit, offset int) ([]Fact, error) {
+	if limit < 0 {
+		limit = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at, tags
+		 FROM facts WHERE cluster_id = ? AND superseded_by IS NULL
+		 ORDER BY created_at ASC LIMIT ? OFFSET ?`,
+		clusterID, limit, offset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite store: list facts by cluster: %w", err)
+	}
+	defer rows.Close()
+
+	facts := []Fact{}
+	for rows.Next() {
+		f, err := scanFactRows(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite store: list facts by cluster: scan: %w", err)
+		}
+		facts = append(facts, *f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite store: list facts by cluster: rows: %w", err)
+	}
+	return facts, nil
+}
+
+func (s *sqliteStore) ListEpisodesByCluster(ctx context.Context, clusterID string, limit, offset int) ([]Episode, error) {
+	if limit < 0 {
+		limit = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, cluster_id, situation, action, outcome, preemptive, embedding, content_hash, created_at, accessed_at, tags
+		 FROM episodes WHERE cluster_id = ?
+		 ORDER BY created_at ASC LIMIT ? OFFSET ?`,
+		clusterID, limit, offset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite store: list episodes by cluster: %w", err)
+	}
+	defer rows.Close()
+
+	episodes := []Episode{}
+	for rows.Next() {
+		ep, err := scanEpisodeRows(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite store: list episodes by cluster: scan: %w", err)
+		}
+		episodes = append(episodes, *ep)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite store: list episodes by cluster: rows: %w", err)
+	}
+	return episodes, nil
+}
+
+func (s *sqliteStore) CountFactsByCluster(ctx context.Context, clusterID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM facts WHERE cluster_id = ? AND superseded_by IS NULL`,
+		clusterID,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite store: count facts by cluster: %w", err)
+	}
+	return n, nil
+}
+
+func (s *sqliteStore) CountEpisodesByCluster(ctx context.Context, clusterID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM episodes WHERE cluster_id = ?`,
+		clusterID,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite store: count episodes by cluster: %w", err)
+	}
+	return n, nil
+}
+
 // --- Fact <-> Episode cross-type links ---
 
 func (s *sqliteStore) LinkFactEpisode(ctx context.Context, factID, episodeID, linkType string) error {

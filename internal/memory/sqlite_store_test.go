@@ -1398,3 +1398,144 @@ func TestSQLiteGetFactSupersedes_UnknownID(t *testing.T) {
 		t.Errorf("unknown id returned %v, want empty slice", got)
 	}
 }
+
+// --- ListFactsByCluster / ListEpisodesByCluster / Count*ByCluster (Phase 1E) ---
+
+func TestSQLiteClusterMembership_PaginatedAndOrdered(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	clusterID := "cluster-1e"
+	if err := s.CreateCluster(ctx, ClusterNode{
+		ID:         clusterID,
+		Summary:    "test",
+		CreatedAt:  time.Now().UTC(),
+		LastAccess: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateCluster: %v", err)
+	}
+
+	base := time.Now().UTC().Add(-time.Hour)
+	for i := 0; i < 5; i++ {
+		_, err := s.InsertFact(ctx, Fact{
+			ClusterID: clusterID,
+			Content:   "f" + string(rune('a'+i)),
+			Subtype:   "project",
+			Source:    "inferred",
+			Embedding: []float32{1, 0, 0, 0},
+			CreatedAt: base.Add(time.Duration(i) * time.Second),
+		})
+		if err != nil {
+			t.Fatalf("InsertFact %d: %v", i, err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		_, err := s.InsertEpisode(ctx, Episode{
+			ClusterID: clusterID,
+			Situation: "s" + string(rune('a'+i)),
+			Embedding: []float32{1, 0, 0, 0},
+			CreatedAt: base.Add(time.Duration(10+i) * time.Second),
+		})
+		if err != nil {
+			t.Fatalf("InsertEpisode %d: %v", i, err)
+		}
+	}
+
+	// Counts.
+	fc, err := s.CountFactsByCluster(ctx, clusterID)
+	if err != nil || fc != 5 {
+		t.Fatalf("CountFactsByCluster = %d (err %v), want 5", fc, err)
+	}
+	ec, err := s.CountEpisodesByCluster(ctx, clusterID)
+	if err != nil || ec != 3 {
+		t.Fatalf("CountEpisodesByCluster = %d (err %v), want 3", ec, err)
+	}
+
+	// Paginated list across two pages — order stable, no gaps.
+	p1, err := s.ListFactsByCluster(ctx, clusterID, 3, 0)
+	if err != nil {
+		t.Fatalf("ListFactsByCluster p1: %v", err)
+	}
+	p2, err := s.ListFactsByCluster(ctx, clusterID, 3, 3)
+	if err != nil {
+		t.Fatalf("ListFactsByCluster p2: %v", err)
+	}
+	if len(p1) != 3 || len(p2) != 2 {
+		t.Fatalf("pages = %d+%d, want 3+2", len(p1), len(p2))
+	}
+	// Ascending ordering.
+	all := append(append([]Fact{}, p1...), p2...)
+	for i := 1; i < len(all); i++ {
+		if all[i].CreatedAt.Before(all[i-1].CreatedAt) {
+			t.Errorf("facts not ordered ASC: %v", all)
+		}
+	}
+}
+
+func TestSQLiteClusterMembership_ExcludesSuperseded(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	clusterID := "cluster-super"
+	if err := s.CreateCluster(ctx, ClusterNode{
+		ID: clusterID, Summary: "t", CreatedAt: time.Now().UTC(), LastAccess: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateCluster: %v", err)
+	}
+
+	oldID, err := s.InsertFact(ctx, Fact{
+		ClusterID: clusterID, Content: "old", Subtype: "project", Source: "inferred",
+		Embedding: []float32{1, 0, 0, 0},
+	})
+	if err != nil {
+		t.Fatalf("InsertFact old: %v", err)
+	}
+	newID, err := s.InsertFact(ctx, Fact{
+		ClusterID: clusterID, Content: "new", Subtype: "project", Source: "inferred",
+		Embedding: []float32{0, 1, 0, 0},
+	})
+	if err != nil {
+		t.Fatalf("InsertFact new: %v", err)
+	}
+	if err := s.SupersedeFact(ctx, oldID, newID); err != nil {
+		t.Fatalf("SupersedeFact: %v", err)
+	}
+
+	got, err := s.ListFactsByCluster(ctx, clusterID, 10, 0)
+	if err != nil {
+		t.Fatalf("ListFactsByCluster: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != newID {
+		t.Errorf("got %d facts (IDs=%v), want [%s]", len(got), idsOf(got), newID)
+	}
+	fc, _ := s.CountFactsByCluster(ctx, clusterID)
+	if fc != 1 {
+		t.Errorf("CountFactsByCluster = %d, want 1", fc)
+	}
+}
+
+func TestSQLiteClusterMembership_UnknownCluster(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if got, err := s.ListFactsByCluster(ctx, "missing", 10, 0); err != nil || len(got) != 0 {
+		t.Errorf("ListFactsByCluster missing = (%v, %v), want (empty, nil)", got, err)
+	}
+	if got, err := s.ListEpisodesByCluster(ctx, "missing", 10, 0); err != nil || len(got) != 0 {
+		t.Errorf("ListEpisodesByCluster missing = (%v, %v), want (empty, nil)", got, err)
+	}
+	if c, err := s.CountFactsByCluster(ctx, "missing"); err != nil || c != 0 {
+		t.Errorf("CountFactsByCluster missing = (%d, %v), want (0, nil)", c, err)
+	}
+	if c, err := s.CountEpisodesByCluster(ctx, "missing"); err != nil || c != 0 {
+		t.Errorf("CountEpisodesByCluster missing = (%d, %v), want (0, nil)", c, err)
+	}
+}
+
+func idsOf(fs []Fact) []string {
+	out := make([]string, len(fs))
+	for i, f := range fs {
+		out[i] = f.ID
+	}
+	return out
+}

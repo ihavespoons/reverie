@@ -499,6 +499,111 @@ func (m *memStore) ListEpisodes(_ context.Context, filter ListFilter) ([]Episode
 	return results, nil
 }
 
+// --- Cluster membership (paginated) ---
+
+func (m *memStore) ListFactsByCluster(_ context.Context, clusterID string, limit, offset int) ([]Fact, error) {
+	if limit < 0 {
+		limit = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Collect non-superseded facts in the cluster, preserving insertion order
+	// (which equals creation order).
+	members := []Fact{}
+	for _, id := range m.order {
+		f := m.facts[id]
+		if f.ClusterID != clusterID {
+			continue
+		}
+		if f.SupersededBy != nil {
+			continue
+		}
+		if f.Tags == nil {
+			f.Tags = []string{}
+		}
+		members = append(members, f)
+	}
+
+	// created_at ascending. m.order is insertion order; do a stable sort on
+	// CreatedAt to be safe against any non-monotonic inserts.
+	sort.SliceStable(members, func(i, j int) bool {
+		return members[i].CreatedAt.Before(members[j].CreatedAt)
+	})
+
+	off := min(offset, len(members))
+	members = members[off:]
+	if len(members) > limit {
+		members = members[:limit]
+	}
+	return members, nil
+}
+
+func (m *memStore) ListEpisodesByCluster(_ context.Context, clusterID string, limit, offset int) ([]Episode, error) {
+	if limit < 0 {
+		limit = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	members := []Episode{}
+	for _, id := range m.episodeOrder {
+		ep := m.episodes[id]
+		if ep.ClusterID != clusterID {
+			continue
+		}
+		if ep.Tags == nil {
+			ep.Tags = []string{}
+		}
+		members = append(members, ep)
+	}
+
+	sort.SliceStable(members, func(i, j int) bool {
+		return members[i].CreatedAt.Before(members[j].CreatedAt)
+	})
+
+	off := min(offset, len(members))
+	members = members[off:]
+	if len(members) > limit {
+		members = members[:limit]
+	}
+	return members, nil
+}
+
+func (m *memStore) CountFactsByCluster(_ context.Context, clusterID string) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	n := 0
+	for _, id := range m.order {
+		f := m.facts[id]
+		if f.ClusterID == clusterID && f.SupersededBy == nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (m *memStore) CountEpisodesByCluster(_ context.Context, clusterID string) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	n := 0
+	for _, id := range m.episodeOrder {
+		ep := m.episodes[id]
+		if ep.ClusterID == clusterID {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // --- Fact <-> Episode cross-type links ---
 
 // addLink adds a link row. Must be called with mu held.
