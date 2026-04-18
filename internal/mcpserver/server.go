@@ -137,6 +137,16 @@ func (s *Server) registerTools(srv *mcpsdk.Server) {
 	}, s.handleList)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "memory_get",
+		Description: "Fetch a single memory (fact or episode) by ID. Returns the full record including cluster metadata, supersede chain (facts: both predecessors via 'supersedes' and successor via 'superseded_by'), cross-type links, and episode-specific fields. Superseded facts are returned when requested by ID — this is the history view.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:  true,
+			OpenWorldHint: &openWorld,
+			Title:         "Get memory by ID",
+		},
+	}, s.handleGet)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name: "memory_apply_judgment",
 		Description: "Apply Gate A verdicts from a memory-judge subagent to a previous memory_recall result. " +
 			"Pass the recall_id from memory_recall and per-candidate keep/drop verdicts. " +

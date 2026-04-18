@@ -872,3 +872,180 @@ func (s *Server) handleDecayTick(ctx context.Context, _ *mcpsdk.CallToolRequest,
 	s.logger.Info("memory_decay_tick", "session_end", in.SessionEnd)
 	return nil, DecayTickOutput{Ticked: true}, nil
 }
+
+// --- memory_get ---
+
+// GetInput is the input schema for the memory_get tool.
+type GetInput struct {
+	ID string `json:"id" jsonschema:"memory ID (fact or episode)"`
+}
+
+// LinkRef is a cross-type link reference returned by memory_get.
+type LinkRef struct {
+	ID       string `json:"id"`
+	Layer    string `json:"layer"`
+	LinkType string `json:"link_type"`
+}
+
+// GetOutput is the output schema for the memory_get tool. It is the full
+// single-record view: basic fields, fact-only supersede chain, episode-only
+// structured fields, and cross-type links.
+type GetOutput struct {
+	ID             string   `json:"id"`
+	Layer          string   `json:"layer"` // "l2_semantic" or "l3_episodic"
+	Content        string   `json:"content"`
+	Subtype        string   `json:"subtype,omitempty"`
+	Source         string   `json:"source,omitempty"`
+	Confidence     float64  `json:"confidence,omitempty"`
+	Tags           []string `json:"tags"`
+	ClusterID      string   `json:"cluster_id"`
+	ClusterSummary string   `json:"cluster_summary,omitempty"`
+	CreatedAt      string   `json:"created_at"`
+	AccessedAt     string   `json:"accessed_at"`
+	// Fact-only fields.
+	ValidFrom    string   `json:"valid_from,omitempty"`
+	SupersededBy *string  `json:"superseded_by,omitempty"`
+	Supersedes   []string `json:"supersedes,omitempty"`
+	// Cross-type links.
+	Links []LinkRef `json:"links,omitempty"`
+	// Episode-only fields.
+	Situation  string `json:"situation,omitempty"`
+	Action     string `json:"action,omitempty"`
+	Outcome    string `json:"outcome,omitempty"`
+	Preemptive string `json:"preemptive,omitempty"`
+}
+
+func (s *Server) handleGet(ctx context.Context, _ *mcpsdk.CallToolRequest, in GetInput) (*mcpsdk.CallToolResult, GetOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, GetOutput{}, nil
+	}
+
+	if in.ID == "" {
+		return nil, GetOutput{}, fmt.Errorf("id is required")
+	}
+
+	// Try fact first. Note: GetFact returns the row regardless of superseded
+	// state, so this is the history-view that the spec requires.
+	fact, err := s.store.GetFact(ctx, in.ID)
+	if err != nil {
+		return nil, GetOutput{}, fmt.Errorf("get fact: %w", err)
+	}
+	if fact != nil {
+		return s.buildGetOutputFact(ctx, fact)
+	}
+
+	ep, err := s.store.GetEpisode(ctx, in.ID)
+	if err != nil {
+		return nil, GetOutput{}, fmt.Errorf("get episode: %w", err)
+	}
+	if ep != nil {
+		return s.buildGetOutputEpisode(ctx, ep)
+	}
+
+	return nil, GetOutput{}, fmt.Errorf("memory not found: %s", in.ID)
+}
+
+// buildGetOutputFact assembles the full GetOutput for an L2 fact, including
+// supersede chain and linked episodes.
+func (s *Server) buildGetOutputFact(ctx context.Context, f *memory.Fact) (*mcpsdk.CallToolResult, GetOutput, error) {
+	out := GetOutput{
+		ID:           f.ID,
+		Layer:        string(memory.TypeL2Semantic),
+		Content:      f.Content,
+		Subtype:      f.Subtype,
+		Source:       f.Source,
+		Confidence:   f.Confidence,
+		Tags:         normalizeTagsSlice(f.Tags),
+		ClusterID:    f.ClusterID,
+		CreatedAt:    f.CreatedAt.Format("2006-01-02T15:04:05Z"),
+		AccessedAt:   f.AccessedAt.Format("2006-01-02T15:04:05Z"),
+		ValidFrom:    f.ValidFrom.Format("2006-01-02T15:04:05Z"),
+		SupersededBy: f.SupersededBy,
+	}
+
+	s.populateClusterSummary(ctx, f.ClusterID, &out)
+
+	supersedes, err := s.store.GetFactSupersedes(ctx, f.ID)
+	if err != nil {
+		return nil, GetOutput{}, fmt.Errorf("get fact supersedes: %w", err)
+	}
+	if len(supersedes) > 0 {
+		out.Supersedes = supersedes
+	}
+
+	// Cross-type links: episodes linked to this fact.
+	links, err := s.store.GetFactLinks(ctx, f.ID)
+	if err != nil {
+		return nil, GetOutput{}, fmt.Errorf("get fact links: %w", err)
+	}
+	for _, l := range links {
+		out.Links = append(out.Links, LinkRef{
+			ID:       l.EpisodeID,
+			Layer:    string(memory.TypeL3Episodic),
+			LinkType: l.LinkType,
+		})
+	}
+
+	s.logger.Info("memory_get", "id", f.ID, "layer", "l2_semantic")
+	return nil, out, nil
+}
+
+// buildGetOutputEpisode assembles the full GetOutput for an L3 episode,
+// including linked facts.
+func (s *Server) buildGetOutputEpisode(ctx context.Context, ep *memory.Episode) (*mcpsdk.CallToolResult, GetOutput, error) {
+	// Render Content the same way memory_list / memory_recall does for
+	// episodes: reuse Candidate.Content() which joins situation/action/
+	// outcome/preemptive with newlines and "Label: " prefixes.
+	content := memory.Candidate{Episode: ep}.Content()
+
+	out := GetOutput{
+		ID:         ep.ID,
+		Layer:      string(memory.TypeL3Episodic),
+		Content:    content,
+		Tags:       normalizeTagsSlice(ep.Tags),
+		ClusterID:  ep.ClusterID,
+		CreatedAt:  ep.CreatedAt.Format("2006-01-02T15:04:05Z"),
+		AccessedAt: ep.AccessedAt.Format("2006-01-02T15:04:05Z"),
+		Situation:  ep.Situation,
+		Action:     ep.Action,
+		Outcome:    ep.Outcome,
+		Preemptive: ep.Preemptive,
+	}
+
+	s.populateClusterSummary(ctx, ep.ClusterID, &out)
+
+	// Cross-type links: facts linked to this episode.
+	links, err := s.store.GetEpisodeLinks(ctx, ep.ID)
+	if err != nil {
+		return nil, GetOutput{}, fmt.Errorf("get episode links: %w", err)
+	}
+	for _, l := range links {
+		out.Links = append(out.Links, LinkRef{
+			ID:       l.FactID,
+			Layer:    string(memory.TypeL2Semantic),
+			LinkType: l.LinkType,
+		})
+	}
+
+	s.logger.Info("memory_get", "id", ep.ID, "layer", "l3_episodic")
+	return nil, out, nil
+}
+
+// populateClusterSummary looks up the cluster and fills ClusterSummary if the
+// cluster exists and has a summary. A missing cluster is logged but not fatal
+// because memory_get is a read-only inspection tool.
+func (s *Server) populateClusterSummary(ctx context.Context, clusterID string, out *GetOutput) {
+	if clusterID == "" {
+		return
+	}
+	cl, err := s.store.GetCluster(ctx, clusterID)
+	if err != nil {
+		s.logger.Warn("memory_get: get cluster failed", "cluster_id", clusterID, "err", err)
+		return
+	}
+	if cl != nil {
+		out.ClusterSummary = cl.Summary
+	}
+}

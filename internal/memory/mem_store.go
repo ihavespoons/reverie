@@ -647,6 +647,21 @@ func (m *memStore) SupersedeFact(_ context.Context, oldID, newID string) error {
 	return nil
 }
 
+func (m *memStore) GetFactSupersedes(_ context.Context, id string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	ids := []string{}
+	// Iterate order for deterministic results.
+	for _, fid := range m.order {
+		f := m.facts[fid]
+		if f.SupersededBy != nil && *f.SupersededBy == id {
+			ids = append(ids, f.ID)
+		}
+	}
+	return ids, nil
+}
+
 func (m *memStore) FindSimilarFacts(_ context.Context, subtype string, queryVec []float32, threshold float32, limit int) ([]Candidate, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

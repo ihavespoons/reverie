@@ -1261,3 +1261,107 @@ func TestMemUpdateClusterMeta_NotFound(t *testing.T) {
 		t.Fatal("UpdateClusterMeta on nonexistent cluster should return error")
 	}
 }
+
+// --- GetFactSupersedes tests (Phase 1C) ---
+
+func TestMemGetFactSupersedes_Empty(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+
+	facts := testdataFacts()
+	id, err := s.InsertFact(ctx, facts[0])
+	if err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+
+	got, err := s.GetFactSupersedes(ctx, id)
+	if err != nil {
+		t.Fatalf("GetFactSupersedes: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetFactSupersedes returned nil; want empty slice")
+	}
+	if len(got) != 0 {
+		t.Errorf("GetFactSupersedes returned %v, want empty slice", got)
+	}
+}
+
+func TestMemGetFactSupersedes_WithPredecessors(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+
+	// Insert three distinct facts so none are deduped by content-hash.
+	f1 := Fact{
+		Content:   "alpha",
+		Subtype:   "project",
+		Source:    "inferred",
+		Embedding: []float32{1, 0, 0, 0},
+	}
+	f2 := Fact{
+		Content:   "beta",
+		Subtype:   "project",
+		Source:    "inferred",
+		Embedding: []float32{0, 1, 0, 0},
+	}
+	f3 := Fact{
+		Content:   "gamma (new winner)",
+		Subtype:   "project",
+		Source:    "inferred",
+		Embedding: []float32{0, 0, 1, 0},
+	}
+
+	id1, err := s.InsertFact(ctx, f1)
+	if err != nil {
+		t.Fatalf("InsertFact[1]: %v", err)
+	}
+	id2, err := s.InsertFact(ctx, f2)
+	if err != nil {
+		t.Fatalf("InsertFact[2]: %v", err)
+	}
+	id3, err := s.InsertFact(ctx, f3)
+	if err != nil {
+		t.Fatalf("InsertFact[3]: %v", err)
+	}
+
+	// id1 and id2 both superseded by id3.
+	if err := s.SupersedeFact(ctx, id1, id3); err != nil {
+		t.Fatalf("SupersedeFact(id1): %v", err)
+	}
+	if err := s.SupersedeFact(ctx, id2, id3); err != nil {
+		t.Fatalf("SupersedeFact(id2): %v", err)
+	}
+
+	got, err := s.GetFactSupersedes(ctx, id3)
+	if err != nil {
+		t.Fatalf("GetFactSupersedes: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d predecessors, want 2: %v", len(got), got)
+	}
+	has := map[string]bool{got[0]: true, got[1]: true}
+	if !has[id1] || !has[id2] {
+		t.Errorf("predecessors = %v, want [%s %s]", got, id1, id2)
+	}
+
+	// id1 by itself supersedes nothing.
+	got1, err := s.GetFactSupersedes(ctx, id1)
+	if err != nil {
+		t.Fatalf("GetFactSupersedes(id1): %v", err)
+	}
+	if len(got1) != 0 {
+		t.Errorf("id1 predecessors = %v, want empty", got1)
+	}
+}
+
+func TestMemGetFactSupersedes_UnknownID(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+
+	got, err := s.GetFactSupersedes(ctx, "nonexistent")
+	if err != nil {
+		t.Fatalf("GetFactSupersedes: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("unknown id returned %v, want empty slice", got)
+	}
+}

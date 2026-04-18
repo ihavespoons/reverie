@@ -120,6 +120,11 @@ type Store interface {
 	// new fact. Returns an error if the old fact does not exist.
 	SupersedeFact(ctx context.Context, oldID, newID string) error
 
+	// GetFactSupersedes returns the IDs of facts whose superseded_by equals the
+	// given id. In other words: the history of facts that this fact replaced.
+	// Returns an empty slice (not nil) when the fact supersedes nothing.
+	GetFactSupersedes(ctx context.Context, id string) ([]string, error)
+
 	// FindSimilarFacts returns non-superseded facts of the given subtype whose
 	// embedding has cosine similarity >= threshold to queryVec. Results are
 	// ordered by descending similarity and capped at limit.

@@ -2154,3 +2154,202 @@ func TestHandleRecall_LinkedIDsRegression(t *testing.T) {
 		t.Error("episode candidate missing linked fact ID")
 	}
 }
+
+// --- memory_get tests (Phase 1C) ---
+
+func TestHandleGet_EmptyID(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, err := s.handleGet(context.Background(), nil, GetInput{ID: ""})
+	if err == nil || err.Error() != "id is required" {
+		t.Fatalf("err = %v, want 'id is required'", err)
+	}
+}
+
+func TestHandleGet_NotFound(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, err := s.handleGet(context.Background(), nil, GetInput{ID: "nonexistent-id"})
+	if err == nil {
+		t.Fatal("expected error for nonexistent id")
+	}
+	if !strings.Contains(err.Error(), "memory not found") {
+		t.Errorf("err = %v, want 'memory not found'", err)
+	}
+}
+
+func TestHandleGet_Fact(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["gettable fact"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, wOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "gettable fact",
+		Type:    "project",
+		Tags:    []string{"phase-1"},
+	})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	_, out, err := s.handleGet(ctx, nil, GetInput{ID: wOut.ID})
+	if err != nil {
+		t.Fatalf("handleGet: %v", err)
+	}
+	if out.ID != wOut.ID {
+		t.Errorf("id = %q, want %q", out.ID, wOut.ID)
+	}
+	if out.Layer != "l2_semantic" {
+		t.Errorf("layer = %q, want l2_semantic", out.Layer)
+	}
+	if out.Content != "gettable fact" {
+		t.Errorf("content = %q, want 'gettable fact'", out.Content)
+	}
+	if out.ClusterID == "" {
+		t.Error("cluster_id should be populated")
+	}
+	if len(out.Tags) != 1 || out.Tags[0] != "phase-1" {
+		t.Errorf("tags = %v, want [phase-1]", out.Tags)
+	}
+	if out.SupersededBy != nil {
+		t.Errorf("superseded_by = %v, want nil", out.SupersededBy)
+	}
+	if len(out.Supersedes) != 0 {
+		t.Errorf("supersedes = %v, want empty", out.Supersedes)
+	}
+	if out.Situation != "" || out.Action != "" {
+		t.Error("episode fields should be empty for a fact")
+	}
+}
+
+func TestHandleGet_Episode(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["sit1\nact1\nout1\npre1"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, wOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Tags: []string{"refactor"},
+		Episode: &EpisodePayload{
+			Situation:  "sit1",
+			Action:     "act1",
+			Outcome:    "out1",
+			Preemptive: "pre1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	_, out, err := s.handleGet(ctx, nil, GetInput{ID: wOut.ID})
+	if err != nil {
+		t.Fatalf("handleGet: %v", err)
+	}
+	if out.Layer != "l3_episodic" {
+		t.Errorf("layer = %q, want l3_episodic", out.Layer)
+	}
+	if out.Situation != "sit1" || out.Action != "act1" || out.Outcome != "out1" || out.Preemptive != "pre1" {
+		t.Errorf("episode fields mismatch: %+v", out)
+	}
+	if out.Content == "" {
+		t.Error("content should be rendered for episode")
+	}
+	if out.SupersededBy != nil || len(out.Supersedes) != 0 {
+		t.Error("supersede fields must be absent for episodes")
+	}
+	if out.ValidFrom != "" {
+		t.Error("valid_from must be absent for episodes")
+	}
+}
+
+func TestHandleGet_SupersededFact(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["old fact"] = []float32{0.1, 0.2, 0.3, 0.4}
+	emb.vectors["new fact"] = []float32{0.4, 0.3, 0.2, 0.1}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, oldOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "old fact", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite old: %v", err)
+	}
+	_, newOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "new fact", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite new: %v", err)
+	}
+	if err := s.store.SupersedeFact(ctx, oldOut.ID, newOut.ID); err != nil {
+		t.Fatalf("SupersedeFact: %v", err)
+	}
+
+	// Fetching the old fact by ID still works (history view) and reports
+	// superseded_by pointing to the new id.
+	_, oldGet, err := s.handleGet(ctx, nil, GetInput{ID: oldOut.ID})
+	if err != nil {
+		t.Fatalf("handleGet old: %v", err)
+	}
+	if oldGet.SupersededBy == nil || *oldGet.SupersededBy != newOut.ID {
+		t.Errorf("superseded_by = %v, want %q", oldGet.SupersededBy, newOut.ID)
+	}
+
+	// The new fact advertises oldOut.ID in its supersedes list.
+	_, newGet, err := s.handleGet(ctx, nil, GetInput{ID: newOut.ID})
+	if err != nil {
+		t.Fatalf("handleGet new: %v", err)
+	}
+	if len(newGet.Supersedes) != 1 || newGet.Supersedes[0] != oldOut.ID {
+		t.Errorf("supersedes = %v, want [%s]", newGet.Supersedes, oldOut.ID)
+	}
+}
+
+func TestHandleGet_LinksBidirectional(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["linked fact"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["ls1\nla1\nlo1\nlp1"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, fOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "linked fact", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite fact: %v", err)
+	}
+	_, eOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Episode: &EpisodePayload{
+			Situation: "ls1", Action: "la1", Outcome: "lo1", Preemptive: "lp1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleWrite episode: %v", err)
+	}
+	if err := s.store.LinkFactEpisode(ctx, fOut.ID, eOut.ID, "related"); err != nil {
+		t.Fatalf("LinkFactEpisode: %v", err)
+	}
+
+	// Fact side advertises the episode link.
+	_, fGet, err := s.handleGet(ctx, nil, GetInput{ID: fOut.ID})
+	if err != nil {
+		t.Fatalf("handleGet fact: %v", err)
+	}
+	if len(fGet.Links) != 1 || fGet.Links[0].ID != eOut.ID || fGet.Links[0].Layer != "l3_episodic" {
+		t.Errorf("fact links = %+v, want one link to %s (l3_episodic)", fGet.Links, eOut.ID)
+	}
+
+	// Episode side advertises the fact link.
+	_, eGet, err := s.handleGet(ctx, nil, GetInput{ID: eOut.ID})
+	if err != nil {
+		t.Fatalf("handleGet episode: %v", err)
+	}
+	if len(eGet.Links) != 1 || eGet.Links[0].ID != fOut.ID || eGet.Links[0].Layer != "l2_semantic" {
+		t.Errorf("episode links = %+v, want one link to %s (l2_semantic)", eGet.Links, fOut.ID)
+	}
+}

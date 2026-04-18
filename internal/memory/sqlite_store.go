@@ -847,6 +847,29 @@ func (s *sqliteStore) SupersedeFact(ctx context.Context, oldID, newID string) er
 	return nil
 }
 
+func (s *sqliteStore) GetFactSupersedes(ctx context.Context, id string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM facts WHERE superseded_by = ?`, id,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite store: get fact supersedes: %w", err)
+	}
+	defer rows.Close()
+
+	ids := []string{}
+	for rows.Next() {
+		var fid string
+		if err := rows.Scan(&fid); err != nil {
+			return nil, fmt.Errorf("sqlite store: get fact supersedes: scan: %w", err)
+		}
+		ids = append(ids, fid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite store: get fact supersedes: rows: %w", err)
+	}
+	return ids, nil
+}
+
 func (s *sqliteStore) FindSimilarFacts(ctx context.Context, subtype string, queryVec []float32, threshold float32, limit int) ([]Candidate, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, cluster_id, content, embedding, content_hash, subtype, source, confidence, valid_from, superseded_by, created_at, accessed_at, tags
