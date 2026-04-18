@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,10 +27,14 @@ var validSubtypes = map[string]bool{
 
 // RecallInput is the input schema for the memory_recall tool.
 type RecallInput struct {
-	Query string   `json:"query" jsonschema:"Natural-language query to search memories"`
-	Limit int      `json:"limit,omitempty" jsonschema:"Maximum number of results (default 10)"`
-	Hints []string `json:"hints,omitempty" jsonschema:"Optional hint strings to augment the query"`
-	Round int      `json:"round,omitempty" jsonschema:"Recall round: 0 for OR-logic (default); 1+ for AND-logic refinement"`
+	Query     string   `json:"query" jsonschema:"Natural-language query to search memories"`
+	Limit     int      `json:"limit,omitempty" jsonschema:"Maximum number of results (default 10)"`
+	Hints     []string `json:"hints,omitempty" jsonschema:"Optional hint strings to augment the query"`
+	Round     int      `json:"round,omitempty" jsonschema:"Recall round: 0 for OR-logic (default); 1+ for AND-logic refinement"`
+	ClusterID string   `json:"cluster_id,omitempty" jsonschema:"restrict to members of this cluster"`
+	Subtype   string   `json:"subtype,omitempty" jsonschema:"restrict to this fact subtype"`
+	Layer     string   `json:"layer,omitempty" jsonschema:"l2, l3, or both (default)"`
+	TagsAny   []string `json:"tags_any,omitempty" jsonschema:"restrict to memories with any of these tags"`
 }
 
 // RecallCandidate is a single candidate in the recall result.
@@ -80,10 +85,27 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	}
 	queryVec := vecs[0]
 
+	// Normalize layer filter up front so invalid inputs fail fast before search.
+	layerFilter, err := normalizeLayerFilter(in.Layer)
+	if err != nil {
+		return nil, RecallOutput{}, err
+	}
+
 	// Global cosine search.
 	candidates, err := s.store.GlobalSearch(ctx, queryVec, limit)
 	if err != nil {
 		return nil, RecallOutput{}, fmt.Errorf("global search: %w", err)
+	}
+
+	// Apply optional filters post-cosine, pre-ranking. Empty filters pass through.
+	if in.ClusterID != "" || in.Subtype != "" || layerFilter != layerBoth || len(in.TagsAny) > 0 {
+		filtered := candidates[:0]
+		for _, c := range candidates {
+			if passesRecallFilters(c, in.ClusterID, in.Subtype, layerFilter, in.TagsAny) {
+				filtered = append(filtered, c)
+			}
+		}
+		candidates = filtered
 	}
 
 	threshold := s.cfg.Memory.SimilarityThreshold
@@ -165,6 +187,89 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 
 	s.logger.Info("memory_recall", "recall_id", out.RecallID, "candidates", len(out.Candidates), "round", in.Round)
 	return nil, out, nil
+}
+
+// layerFilter represents the normalized Recall layer filter.
+type layerFilter int
+
+const (
+	layerBoth layerFilter = iota
+	layerL2Only
+	layerL3Only
+)
+
+// normalizeLayerFilter maps the raw input string to a layerFilter value.
+// Accepts "", "both" (pass-through); "l2", "L2", "l2_semantic" (L2-only);
+// "l3", "L3", "l3_episodic" (L3-only). Any other value is an error.
+func normalizeLayerFilter(in string) (layerFilter, error) {
+	switch strings.ToLower(in) {
+	case "", "both":
+		return layerBoth, nil
+	case "l2", "l2_semantic":
+		return layerL2Only, nil
+	case "l3", "l3_episodic":
+		return layerL3Only, nil
+	default:
+		return layerBoth, fmt.Errorf("invalid layer %q: must be one of l2, l3, or both", in)
+	}
+}
+
+// passesRecallFilters returns true if the candidate satisfies every active
+// filter. Empty filter fields are pass-through. Semantics per the 2E spec:
+//   - cluster_id: candidate's cluster_id must match.
+//   - subtype: fact subtype must match; episodes always fail this filter.
+//   - layer: L2-only excludes episodes; L3-only excludes facts.
+//   - tags_any: union — at least one of the candidate's tags must appear in
+//     the filter set (empty filter set is pass-through).
+func passesRecallFilters(c memory.Candidate, clusterID, subtype string, layer layerFilter, tagsAny []string) bool {
+	if clusterID != "" && c.ClusterID() != clusterID {
+		return false
+	}
+	if subtype != "" {
+		if c.Fact == nil || c.Fact.Subtype != subtype {
+			return false
+		}
+	}
+	switch layer {
+	case layerL2Only:
+		if c.Fact == nil {
+			return false
+		}
+	case layerL3Only:
+		if c.Episode == nil {
+			return false
+		}
+	}
+	if len(tagsAny) > 0 {
+		var candTags []string
+		switch {
+		case c.Fact != nil:
+			candTags = c.Fact.Tags
+		case c.Episode != nil:
+			candTags = c.Episode.Tags
+		}
+		if !tagsOverlap(candTags, tagsAny) {
+			return false
+		}
+	}
+	return true
+}
+
+// tagsOverlap returns true if a and b share at least one tag.
+func tagsOverlap(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, t := range a {
+		set[t] = struct{}{}
+	}
+	for _, t := range b {
+		if _, ok := set[t]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // --- memory_write ---

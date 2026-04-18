@@ -3288,3 +3288,300 @@ func TestHandleMergeClusters_EmptySourceList(t *testing.T) {
 		t.Errorf("error = %q, want it to contain 'source_cluster_ids must be non-empty'", err)
 	}
 }
+
+// --- memory_recall filter tests (Phase 2E) ---
+
+// seedRecallFilterFixture writes two facts in distinct clusters (orthogonal
+// embeddings so the 0.60 assigner threshold doesn't fold them), a third fact
+// tagged "hot" in cluster A, and an episode in cluster A. All vectors share
+// non-zero components with the query "q" so GlobalSearch returns them all.
+// Returns IDs + cluster IDs for filter assertions.
+type recallFilterFixture struct {
+	factA1ID  string // cluster A, subtype "project", tag "hot"
+	factA2ID  string // cluster A, subtype "user",    no tag
+	factBID   string // cluster B, subtype "project", tag "cold"
+	episodeID string // cluster A (same vector as factA1)
+	clusterA  string
+	clusterB  string
+}
+
+func seedRecallFilterFixture(t *testing.T, s *Server, emb *stubEmbedder) recallFilterFixture {
+	t.Helper()
+	ctx := context.Background()
+
+	// Orthogonal embeddings so the two groups land in different clusters.
+	// All vectors have positive components along all axes so cosine with a
+	// uniform query vector is > 0 (ensures every candidate is returned).
+	emb.vectors["fact a1"] = []float32{1, 0, 0, 0}
+	emb.vectors["fact a2"] = []float32{0.99, 0.01, 0, 0}
+	emb.vectors["fact b"] = []float32{0, 1, 0, 0}
+	// Episode text is the concatenation writeEpisode embeds over.
+	emb.vectors["sit\nact\nout\npre"] = []float32{0.98, 0.02, 0, 0}
+	// Query must cover both clusters for GlobalSearch to return members of
+	// each. Use a bias toward axis 0 so cluster-A members are first, but
+	// include a small axis-1 component so cluster-B is also returned.
+	emb.vectors["q"] = []float32{0.9, 0.1, 0, 0}
+
+	_, a1, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact a1", Type: "project", Tags: []string{"hot"}})
+	if err != nil {
+		t.Fatalf("write a1: %v", err)
+	}
+	_, a2, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact a2", Type: "user"})
+	if err != nil {
+		t.Fatalf("write a2: %v", err)
+	}
+	_, b, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact b", Type: "project", Tags: []string{"cold"}})
+	if err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	_, ep, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Episode: &EpisodePayload{
+			Situation: "sit", Action: "act", Outcome: "out", Preemptive: "pre",
+		},
+	})
+	if err != nil {
+		t.Fatalf("write episode: %v", err)
+	}
+
+	fa1, _ := s.store.GetFact(ctx, a1.ID)
+	fa2, _ := s.store.GetFact(ctx, a2.ID)
+	fb, _ := s.store.GetFact(ctx, b.ID)
+	eep, _ := s.store.GetEpisode(ctx, ep.ID)
+
+	if fa1.ClusterID != fa2.ClusterID {
+		t.Fatalf("expected a1,a2 in same cluster; got %q and %q", fa1.ClusterID, fa2.ClusterID)
+	}
+	if fa1.ClusterID == fb.ClusterID {
+		t.Fatalf("expected b in separate cluster; all in %s", fa1.ClusterID)
+	}
+	if eep.ClusterID != fa1.ClusterID {
+		t.Fatalf("expected episode in cluster A %q; got %q", fa1.ClusterID, eep.ClusterID)
+	}
+
+	return recallFilterFixture{
+		factA1ID:  a1.ID,
+		factA2ID:  a2.ID,
+		factBID:   b.ID,
+		episodeID: ep.ID,
+		clusterA:  fa1.ClusterID,
+		clusterB:  fb.ClusterID,
+	}
+}
+
+// recallIDs returns the IDs of every candidate in out, for convenient
+// membership assertions.
+func recallIDs(out RecallOutput) []string {
+	ids := make([]string, len(out.Candidates))
+	for i, c := range out.Candidates {
+		ids[i] = c.ID
+	}
+	return ids
+}
+
+func containsID(ids []string, id string) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+func TestHandleRecall_ClusterIDFilter(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	fix := seedRecallFilterFixture(t, s, emb)
+
+	_, out, err := s.handleRecall(context.Background(), nil, RecallInput{
+		Query:     "q",
+		ClusterID: fix.clusterA,
+	})
+	if err != nil {
+		t.Fatalf("handleRecall: %v", err)
+	}
+	ids := recallIDs(out)
+	if containsID(ids, fix.factBID) {
+		t.Errorf("fact B (cluster B) should not appear when filtering to cluster A; ids=%v", ids)
+	}
+	if !containsID(ids, fix.factA1ID) || !containsID(ids, fix.factA2ID) {
+		t.Errorf("expected cluster-A facts in result; ids=%v", ids)
+	}
+	for _, c := range out.Candidates {
+		if c.ClusterID != fix.clusterA {
+			t.Errorf("candidate %s has cluster %q, want %q", c.ID, c.ClusterID, fix.clusterA)
+		}
+	}
+}
+
+func TestHandleRecall_SubtypeFilter(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	fix := seedRecallFilterFixture(t, s, emb)
+
+	_, out, err := s.handleRecall(context.Background(), nil, RecallInput{
+		Query:   "q",
+		Subtype: "project",
+	})
+	if err != nil {
+		t.Fatalf("handleRecall: %v", err)
+	}
+	ids := recallIDs(out)
+	// project facts (a1, b) pass; user fact (a2) and the episode drop.
+	if !containsID(ids, fix.factA1ID) {
+		t.Errorf("expected fact a1 (project) in result; ids=%v", ids)
+	}
+	if !containsID(ids, fix.factBID) {
+		t.Errorf("expected fact b (project) in result; ids=%v", ids)
+	}
+	if containsID(ids, fix.factA2ID) {
+		t.Errorf("fact a2 (user) should be filtered out; ids=%v", ids)
+	}
+	if containsID(ids, fix.episodeID) {
+		t.Errorf("episode should be filtered out by subtype filter; ids=%v", ids)
+	}
+	for _, c := range out.Candidates {
+		if c.Subtype != "project" {
+			t.Errorf("candidate %s has subtype %q, want project", c.ID, c.Subtype)
+		}
+	}
+}
+
+func TestHandleRecall_LayerL2Filter(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	fix := seedRecallFilterFixture(t, s, emb)
+
+	for _, layerVal := range []string{"l2", "L2", "l2_semantic"} {
+		_, out, err := s.handleRecall(context.Background(), nil, RecallInput{
+			Query: "q",
+			Layer: layerVal,
+		})
+		if err != nil {
+			t.Fatalf("handleRecall(layer=%q): %v", layerVal, err)
+		}
+		ids := recallIDs(out)
+		if containsID(ids, fix.episodeID) {
+			t.Errorf("layer=%q: episode should be excluded; ids=%v", layerVal, ids)
+		}
+		for _, c := range out.Candidates {
+			if c.Layer != "l2_semantic" {
+				t.Errorf("layer=%q: candidate %s has layer %q, want l2_semantic", layerVal, c.ID, c.Layer)
+			}
+		}
+	}
+}
+
+func TestHandleRecall_LayerL3Filter(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	fix := seedRecallFilterFixture(t, s, emb)
+
+	for _, layerVal := range []string{"l3", "l3_episodic"} {
+		_, out, err := s.handleRecall(context.Background(), nil, RecallInput{
+			Query: "q",
+			Layer: layerVal,
+		})
+		if err != nil {
+			t.Fatalf("handleRecall(layer=%q): %v", layerVal, err)
+		}
+		ids := recallIDs(out)
+		if containsID(ids, fix.factA1ID) || containsID(ids, fix.factA2ID) || containsID(ids, fix.factBID) {
+			t.Errorf("layer=%q: facts should be excluded; ids=%v", layerVal, ids)
+		}
+		for _, c := range out.Candidates {
+			if c.Layer != "l3_episodic" {
+				t.Errorf("layer=%q: candidate %s has layer %q, want l3_episodic", layerVal, c.ID, c.Layer)
+			}
+		}
+	}
+}
+
+func TestHandleRecall_LayerInvalid(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, err := s.handleRecall(context.Background(), nil, RecallInput{
+		Query: "q",
+		Layer: "nonsense",
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid layer value")
+	}
+	if !strings.Contains(err.Error(), "invalid layer") {
+		t.Errorf("error = %q, want it to contain 'invalid layer'", err)
+	}
+}
+
+func TestHandleRecall_TagsAnyFilter(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	fix := seedRecallFilterFixture(t, s, emb)
+
+	_, out, err := s.handleRecall(context.Background(), nil, RecallInput{
+		Query:   "q",
+		TagsAny: []string{"hot", "stranger"}, // union: "hot" matches factA1 only.
+	})
+	if err != nil {
+		t.Fatalf("handleRecall: %v", err)
+	}
+	ids := recallIDs(out)
+	if !containsID(ids, fix.factA1ID) {
+		t.Errorf("expected factA1 (tag=hot) in result; ids=%v", ids)
+	}
+	if containsID(ids, fix.factA2ID) {
+		t.Errorf("factA2 (untagged) should be filtered out; ids=%v", ids)
+	}
+	if containsID(ids, fix.factBID) {
+		t.Errorf("factB (tag=cold) should be filtered out; ids=%v", ids)
+	}
+	if containsID(ids, fix.episodeID) {
+		t.Errorf("episode (untagged) should be filtered out; ids=%v", ids)
+	}
+}
+
+func TestHandleRecall_CombinedFilters(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	fix := seedRecallFilterFixture(t, s, emb)
+
+	// cluster_id=A ∩ tags_any=[hot] → only factA1.
+	_, out, err := s.handleRecall(context.Background(), nil, RecallInput{
+		Query:     "q",
+		ClusterID: fix.clusterA,
+		TagsAny:   []string{"hot"},
+	})
+	if err != nil {
+		t.Fatalf("handleRecall: %v", err)
+	}
+	ids := recallIDs(out)
+	if len(ids) != 1 || ids[0] != fix.factA1ID {
+		t.Errorf("expected exactly [factA1]; got %v", ids)
+	}
+
+	// cluster_id=B ∩ tags_any=[hot] → empty (B has no "hot" member).
+	_, out2, err := s.handleRecall(context.Background(), nil, RecallInput{
+		Query:     "q",
+		ClusterID: fix.clusterB,
+		TagsAny:   []string{"hot"},
+	})
+	if err != nil {
+		t.Fatalf("handleRecall 2: %v", err)
+	}
+	if len(out2.Candidates) != 0 {
+		t.Errorf("expected empty result for cluster=B + tag=hot; got %v", recallIDs(out2))
+	}
+}
