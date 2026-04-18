@@ -828,6 +828,83 @@ func (m *memStore) UpdateEpisodeEmbedding(_ context.Context, id string, embeddin
 	return nil
 }
 
+// --- Content amendments (Phase 2D) ---
+
+// UpdateFactContent updates content, content_hash, embedding, optionally tags,
+// and accessed_at. A nil `tags` pointer preserves the existing tag set; a
+// non-nil pointer (even to an empty slice) replaces it.
+func (m *memStore) UpdateFactContent(_ context.Context, id, content, contentHash string, embedding []float32, tags *[]string) error {
+	var normTags []string
+	if tags != nil {
+		nt, err := normalizeTags(*tags)
+		if err != nil {
+			return fmt.Errorf("mem store: update fact content: %w", err)
+		}
+		normTags = nt
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	f, ok := m.facts[id]
+	if !ok {
+		return fmt.Errorf("mem store: update fact content: fact %q not found", id)
+	}
+	f.Content = content
+	f.ContentHash = contentHash
+	f.Embedding = embedding
+	f.AccessedAt = time.Now().UTC()
+	if tags != nil {
+		f.Tags = normTags
+	}
+	m.facts[id] = f
+	return nil
+}
+
+// UpdateEpisodeContent amends situation/action/outcome/preemptive, embedding,
+// content_hash, and tags on an episode. accessed_at is bumped. ID, cluster_id,
+// and created_at are preserved. The handler is responsible for populating
+// e.Tags with the existing set when preservation is desired (value semantics
+// preclude nil-vs-empty discrimination here).
+func (m *memStore) UpdateEpisodeContent(_ context.Context, id string, e Episode) error {
+	normTags, err := normalizeTags(e.Tags)
+	if err != nil {
+		return fmt.Errorf("mem store: update episode content: %w", err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	existing, ok := m.episodes[id]
+	if !ok {
+		return fmt.Errorf("mem store: update episode content: episode %q not found", id)
+	}
+	existing.Situation = e.Situation
+	existing.Action = e.Action
+	existing.Outcome = e.Outcome
+	existing.Preemptive = e.Preemptive
+	existing.Embedding = e.Embedding
+	existing.ContentHash = e.ContentHash
+	existing.Tags = normTags
+	existing.AccessedAt = time.Now().UTC()
+	m.episodes[id] = existing
+	return nil
+}
+
+// ReplaceEpisodeLinks clears and re-populates the link set for a given
+// episode. nil and empty slices both clear all links; callers that want to
+// preserve existing links must not call this method.
+func (m *memStore) ReplaceEpisodeLinks(_ context.Context, episodeID string, factIDs []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.deleteLinksByEpisode(episodeID)
+	for _, factID := range factIDs {
+		m.addLink(factID, episodeID, "evidence")
+	}
+	return nil
+}
+
 // --- Temporal conflict resolution ---
 
 func (m *memStore) SupersedeFact(_ context.Context, oldID, newID string) error {

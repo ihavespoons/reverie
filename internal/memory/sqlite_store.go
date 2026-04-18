@@ -1053,6 +1053,138 @@ func (s *sqliteStore) UpdateEpisodeEmbedding(ctx context.Context, id string, emb
 	return nil
 }
 
+// --- Content amendments (Phase 2D) ---
+
+// UpdateFactContent updates content, content_hash, embedding, optionally tags,
+// and accessed_at for the given fact. Other columns (cluster_id, created_at,
+// valid_from, superseded_by, subtype, source, confidence) are preserved.
+//
+// Tags tri-state: a nil `tags` pointer preserves the existing row; a non-nil
+// pointer replaces it — even when the pointed-to slice is empty (which clears
+// the tag set).
+func (s *sqliteStore) UpdateFactContent(ctx context.Context, id, content, contentHash string, embedding []float32, tags *[]string) error {
+	now := time.Now().UTC().Format(timeFormat)
+	embBlob := EncodeVector(embedding)
+
+	if tags != nil {
+		normTags, err := normalizeTags(*tags)
+		if err != nil {
+			return fmt.Errorf("sqlite store: update fact content: %w", err)
+		}
+		tagsJSON, err := encodeTags(normTags)
+		if err != nil {
+			return fmt.Errorf("sqlite store: update fact content: %w", err)
+		}
+		res, err := s.db.ExecContext(ctx,
+			`UPDATE facts SET content = ?, content_hash = ?, embedding = ?, tags = ?, accessed_at = ?
+			 WHERE id = ?`,
+			content, contentHash, embBlob, tagsJSON, now, id,
+		)
+		if err != nil {
+			return fmt.Errorf("sqlite store: update fact content: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("sqlite store: update fact content: rows affected: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("sqlite store: update fact content: fact %q not found", id)
+		}
+		return nil
+	}
+
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE facts SET content = ?, content_hash = ?, embedding = ?, accessed_at = ?
+		 WHERE id = ?`,
+		content, contentHash, embBlob, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite store: update fact content: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite store: update fact content: rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("sqlite store: update fact content: fact %q not found", id)
+	}
+	return nil
+}
+
+// UpdateEpisodeContent amends the situation/action/outcome/preemptive fields,
+// the embedding, the content_hash, and the tags of an episode. accessed_at is
+// bumped to now. ID, cluster_id, and created_at are preserved.
+//
+// The caller must pre-populate e.Tags with either the existing tag set (to
+// preserve) or the new tag set (to replace). Implementations cannot
+// distinguish a nil vs zero-length slice through the value form, so the
+// handler is the source of truth on preservation.
+func (s *sqliteStore) UpdateEpisodeContent(ctx context.Context, id string, e Episode) error {
+	now := time.Now().UTC().Format(timeFormat)
+	embBlob := EncodeVector(e.Embedding)
+
+	normTags, err := normalizeTags(e.Tags)
+	if err != nil {
+		return fmt.Errorf("sqlite store: update episode content: %w", err)
+	}
+	tagsJSON, err := encodeTags(normTags)
+	if err != nil {
+		return fmt.Errorf("sqlite store: update episode content: %w", err)
+	}
+
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE episodes
+		 SET situation = ?, action = ?, outcome = ?, preemptive = ?,
+		     embedding = ?, content_hash = ?, tags = ?, accessed_at = ?
+		 WHERE id = ?`,
+		e.Situation, e.Action, e.Outcome, e.Preemptive,
+		embBlob, e.ContentHash, tagsJSON, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite store: update episode content: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite store: update episode content: rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("sqlite store: update episode content: episode %q not found", id)
+	}
+	return nil
+}
+
+// ReplaceEpisodeLinks atomically replaces the set of fact_episode_links for
+// the given episode with rows for the supplied factIDs. nil is equivalent to
+// an empty slice (clears links) — callers that want to preserve existing
+// links must skip calling this method.
+func (s *sqliteStore) ReplaceEpisodeLinks(ctx context.Context, episodeID string, factIDs []string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite store: replace episode links: begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM fact_episode_links WHERE episode_id = ?`, episodeID,
+	); err != nil {
+		return fmt.Errorf("sqlite store: replace episode links: delete: %w", err)
+	}
+
+	for _, factID := range factIDs {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO fact_episode_links (fact_id, episode_id, link_type) VALUES (?, ?, ?)`,
+			factID, episodeID, "evidence",
+		); err != nil {
+			return fmt.Errorf("sqlite store: replace episode links: insert fact %s: %w", factID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite store: replace episode links: commit: %w", err)
+	}
+	return nil
+}
+
 // --- Temporal conflict resolution ---
 
 func (s *sqliteStore) SupersedeFact(ctx context.Context, oldID, newID string) error {

@@ -3585,3 +3585,508 @@ func TestHandleRecall_CombinedFilters(t *testing.T) {
 		t.Errorf("expected empty result for cluster=B + tag=hot; got %v", recallIDs(out2))
 	}
 }
+
+// --- memory_update_content tests ---
+
+func TestHandleUpdateContent_Fact(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["old"] = []float32{1, 0, 0, 0}
+	emb.vectors["new"] = []float32{0, 1, 0, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, wOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "old", Type: "project", Tags: []string{"t1"}})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	before, err := s.store.GetFact(ctx, wOut.ID)
+	if err != nil || before == nil {
+		t.Fatalf("GetFact before: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	_, out, err := s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID:      wOut.ID,
+		Content: "new",
+	})
+	if err != nil {
+		t.Fatalf("handleUpdateContent: %v", err)
+	}
+	if out.ID != wOut.ID {
+		t.Errorf("ID = %q, want %q", out.ID, wOut.ID)
+	}
+	if out.Layer != "l2_semantic" {
+		t.Errorf("Layer = %q, want l2_semantic", out.Layer)
+	}
+	if !out.Reembedded {
+		t.Error("Reembedded = false, want true")
+	}
+
+	after, err := s.store.GetFact(ctx, wOut.ID)
+	if err != nil || after == nil {
+		t.Fatalf("GetFact after: %v", err)
+	}
+	if after.Content != "new" {
+		t.Errorf("Content = %q, want 'new'", after.Content)
+	}
+	if after.ContentHash == before.ContentHash {
+		t.Errorf("ContentHash unchanged: %q", after.ContentHash)
+	}
+	if vectorsEqual(after.Embedding, before.Embedding) {
+		t.Errorf("Embedding unchanged: %v", after.Embedding)
+	}
+	if !after.AccessedAt.After(before.AccessedAt) {
+		t.Errorf("AccessedAt not bumped: before=%v after=%v", before.AccessedAt, after.AccessedAt)
+	}
+	if !after.CreatedAt.Equal(before.CreatedAt) {
+		t.Errorf("CreatedAt changed: before=%v after=%v", before.CreatedAt, after.CreatedAt)
+	}
+	if after.ClusterID != before.ClusterID {
+		t.Errorf("ClusterID changed: before=%q after=%q", before.ClusterID, after.ClusterID)
+	}
+	if !after.ValidFrom.Equal(before.ValidFrom) {
+		t.Errorf("ValidFrom changed: before=%v after=%v", before.ValidFrom, after.ValidFrom)
+	}
+	if len(after.Tags) != 1 || after.Tags[0] != "t1" {
+		t.Errorf("Tags = %v, want [t1] (preserved)", after.Tags)
+	}
+}
+
+func TestHandleUpdateContent_TagsOnly(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["keep this content"] = []float32{0.3, 0.4, 0.5, 0.7}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, wOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "keep this content", Type: "project", Tags: []string{"old1", "old2"}})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	newTags := []string{"fresh"}
+	_, _, err = s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID:   wOut.ID,
+		Tags: &newTags,
+	})
+	if err != nil {
+		t.Fatalf("handleUpdateContent: %v", err)
+	}
+
+	got, err := s.store.GetFact(ctx, wOut.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetFact: %v", err)
+	}
+	if got.Content != "keep this content" {
+		t.Errorf("Content = %q, want 'keep this content' (preserved)", got.Content)
+	}
+	if len(got.Tags) != 1 || got.Tags[0] != "fresh" {
+		t.Errorf("Tags = %v, want [fresh]", got.Tags)
+	}
+}
+
+func TestHandleUpdateContent_TagsNilPreserves(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["orig"] = []float32{1, 0, 0, 0}
+	emb.vectors["amended"] = []float32{0, 1, 0, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, wOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "orig", Type: "project", Tags: []string{"a", "b"}})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	_, _, err = s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID:      wOut.ID,
+		Content: "amended",
+	})
+	if err != nil {
+		t.Fatalf("handleUpdateContent: %v", err)
+	}
+	got, err := s.store.GetFact(ctx, wOut.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetFact: %v", err)
+	}
+	if len(got.Tags) != 2 || got.Tags[0] != "a" || got.Tags[1] != "b" {
+		t.Errorf("Tags = %v, want [a b] (preserved)", got.Tags)
+	}
+}
+
+func TestHandleUpdateContent_TagsEmptyClears(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["foo"] = []float32{1, 0, 0, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, wOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "foo", Type: "project", Tags: []string{"a", "b"}})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	empty := []string{}
+	_, _, err = s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID:   wOut.ID,
+		Tags: &empty,
+	})
+	if err != nil {
+		t.Fatalf("handleUpdateContent: %v", err)
+	}
+	got, err := s.store.GetFact(ctx, wOut.ID)
+	if err != nil || got == nil {
+		t.Fatalf("GetFact: %v", err)
+	}
+	if len(got.Tags) != 0 {
+		t.Errorf("Tags = %v, want []", got.Tags)
+	}
+}
+
+func TestHandleUpdateContent_Episode(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["s1\na1\no1\np1"] = []float32{1, 0, 0, 0}
+	emb.vectors["s2\na2\no2\np2"] = []float32{0, 1, 0, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, wOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Tags: []string{"orig"},
+		Episode: &EpisodePayload{
+			Situation: "s1", Action: "a1", Outcome: "o1", Preemptive: "p1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	before, err := s.store.GetEpisode(ctx, wOut.ID)
+	if err != nil || before == nil {
+		t.Fatalf("GetEpisode before: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	// Update episode fields; LinkedFactIDs nil => preserve (which is empty set here).
+	_, out, err := s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID: wOut.ID,
+		Episode: &EpisodePayload{
+			Situation: "s2", Action: "a2", Outcome: "o2", Preemptive: "p2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleUpdateContent: %v", err)
+	}
+	if out.Layer != "l3_episodic" || !out.Reembedded {
+		t.Errorf("out = %+v, want l3_episodic, reembedded", out)
+	}
+
+	after, err := s.store.GetEpisode(ctx, wOut.ID)
+	if err != nil || after == nil {
+		t.Fatalf("GetEpisode after: %v", err)
+	}
+	if after.Situation != "s2" || after.Action != "a2" || after.Outcome != "o2" || after.Preemptive != "p2" {
+		t.Errorf("episode fields = %+v, want s2/a2/o2/p2", after)
+	}
+	if vectorsEqual(after.Embedding, before.Embedding) {
+		t.Errorf("Embedding unchanged: %v", after.Embedding)
+	}
+	if !after.AccessedAt.After(before.AccessedAt) {
+		t.Errorf("AccessedAt not bumped: before=%v after=%v", before.AccessedAt, after.AccessedAt)
+	}
+	if !after.CreatedAt.Equal(before.CreatedAt) {
+		t.Errorf("CreatedAt changed: before=%v after=%v", before.CreatedAt, after.CreatedAt)
+	}
+	if len(after.Tags) != 1 || after.Tags[0] != "orig" {
+		t.Errorf("Tags = %v, want [orig] (preserved)", after.Tags)
+	}
+}
+
+func TestHandleUpdateContent_EpisodeLinksReplacement(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["es1\nea1\neo1\nep1"] = []float32{1, 0, 0, 0}
+	emb.vectors["es2\nea2\neo2\nep2"] = []float32{0, 1, 0, 0}
+	emb.vectors["fact1"] = []float32{0, 0, 1, 0}
+	emb.vectors["fact2"] = []float32{0, 0, 0, 1}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	// Two facts to link to.
+	_, f1Out, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact1", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite f1: %v", err)
+	}
+	_, f2Out, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact2", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite f2: %v", err)
+	}
+
+	// Episode initially linked to f1.
+	_, epOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Episode: &EpisodePayload{
+			Situation: "es1", Action: "ea1", Outcome: "eo1", Preemptive: "ep1",
+			LinkedFactIDs: []string{f1Out.ID},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleWrite episode: %v", err)
+	}
+
+	// nil LinkedFactIDs preserves.
+	_, _, err = s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID: epOut.ID,
+		Episode: &EpisodePayload{
+			Situation: "es1", Action: "ea1", Outcome: "eo1", Preemptive: "ep1",
+			LinkedFactIDs: nil,
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleUpdateContent preserve: %v", err)
+	}
+	ep, _ := s.store.GetEpisode(ctx, epOut.ID)
+	if len(ep.LinkedFactIDs) != 1 || ep.LinkedFactIDs[0] != f1Out.ID {
+		t.Errorf("after preserve: links = %v, want [%s]", ep.LinkedFactIDs, f1Out.ID)
+	}
+
+	// Non-nil non-empty replaces.
+	_, _, err = s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID: epOut.ID,
+		Episode: &EpisodePayload{
+			Situation: "es2", Action: "ea2", Outcome: "eo2", Preemptive: "ep2",
+			LinkedFactIDs: []string{f2Out.ID},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleUpdateContent replace: %v", err)
+	}
+	ep, _ = s.store.GetEpisode(ctx, epOut.ID)
+	if len(ep.LinkedFactIDs) != 1 || ep.LinkedFactIDs[0] != f2Out.ID {
+		t.Errorf("after replace: links = %v, want [%s]", ep.LinkedFactIDs, f2Out.ID)
+	}
+
+	// Explicit empty clears.
+	_, _, err = s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID: epOut.ID,
+		Episode: &EpisodePayload{
+			Situation: "es2", Action: "ea2", Outcome: "eo2", Preemptive: "ep2",
+			LinkedFactIDs: []string{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleUpdateContent clear: %v", err)
+	}
+	ep, _ = s.store.GetEpisode(ctx, epOut.ID)
+	if len(ep.LinkedFactIDs) != 0 {
+		t.Errorf("after clear: links = %v, want []", ep.LinkedFactIDs)
+	}
+}
+
+func TestHandleUpdateContent_LayerMismatch_EpisodeOnFact(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["i am a fact"] = []float32{1, 0, 0, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, wOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "i am a fact", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	_, _, err = s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID: wOut.ID,
+		Episode: &EpisodePayload{
+			Situation: "x", Action: "y", Outcome: "z", Preemptive: "w",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected layer mismatch error")
+	}
+	if !strings.Contains(err.Error(), "layer mismatch") {
+		t.Errorf("err = %q, want 'layer mismatch'", err)
+	}
+}
+
+func TestHandleUpdateContent_LayerMismatch_ContentOnEpisode(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["es\nea\neo\nep"] = []float32{1, 0, 0, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, wOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Episode: &EpisodePayload{
+			Situation: "es", Action: "ea", Outcome: "eo", Preemptive: "ep",
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	_, _, err = s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID:      wOut.ID,
+		Content: "should not apply",
+	})
+	if err == nil {
+		t.Fatal("expected layer mismatch error")
+	}
+	if !strings.Contains(err.Error(), "layer mismatch") {
+		t.Errorf("err = %q, want 'layer mismatch'", err)
+	}
+}
+
+func TestHandleUpdateContent_BothContentAndEpisode(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, err := s.handleUpdateContent(context.Background(), nil, UpdateContentInput{
+		ID:      "any",
+		Content: "x",
+		Episode: &EpisodePayload{Situation: "y"},
+	})
+	if err == nil {
+		t.Fatal("expected error for both content and episode")
+	}
+	if !strings.Contains(err.Error(), "content OR episode") {
+		t.Errorf("err = %q, want to mention 'content OR episode'", err)
+	}
+}
+
+func TestHandleUpdateContent_NothingToUpdate(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, err := s.handleUpdateContent(context.Background(), nil, UpdateContentInput{ID: "any"})
+	if err == nil {
+		t.Fatal("expected error for empty update")
+	}
+	if !strings.Contains(err.Error(), "nothing to update") {
+		t.Errorf("err = %q, want 'nothing to update'", err)
+	}
+}
+
+func TestHandleUpdateContent_NotFound(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, err := s.handleUpdateContent(context.Background(), nil, UpdateContentInput{
+		ID:      "ghost",
+		Content: "x",
+	})
+	if err == nil {
+		t.Fatal("expected not-found error")
+	}
+	if !strings.Contains(err.Error(), "memory not found: ghost") {
+		t.Errorf("err = %q, want 'memory not found: ghost'", err)
+	}
+}
+
+func TestHandleUpdateContent_SupersededFactUpdatesPreservingSupersededBy(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["old"] = []float32{1, 0, 0, 0}
+	emb.vectors["new-replacement"] = []float32{0, 1, 0, 0}
+	emb.vectors["corrected"] = []float32{0, 0, 1, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, oldOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "old", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite old: %v", err)
+	}
+	_, newOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "new-replacement", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite new: %v", err)
+	}
+	if err := s.store.SupersedeFact(ctx, oldOut.ID, newOut.ID); err != nil {
+		t.Fatalf("SupersedeFact: %v", err)
+	}
+
+	// Confirm old is superseded before our update.
+	before, _ := s.store.GetFact(ctx, oldOut.ID)
+	if before.SupersededBy == nil || *before.SupersededBy != newOut.ID {
+		t.Fatalf("pre: superseded_by = %v, want %q", before.SupersededBy, newOut.ID)
+	}
+
+	_, _, err = s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID:      oldOut.ID,
+		Content: "corrected",
+	})
+	if err != nil {
+		t.Fatalf("handleUpdateContent on superseded fact: %v", err)
+	}
+
+	after, _ := s.store.GetFact(ctx, oldOut.ID)
+	if after.Content != "corrected" {
+		t.Errorf("Content = %q, want 'corrected'", after.Content)
+	}
+	if after.ContentHash == before.ContentHash {
+		t.Errorf("ContentHash unchanged: %q", after.ContentHash)
+	}
+	if vectorsEqual(after.Embedding, before.Embedding) {
+		t.Errorf("Embedding unchanged: %v", after.Embedding)
+	}
+	if after.SupersededBy == nil || *after.SupersededBy != newOut.ID {
+		t.Errorf("superseded_by = %v, want %q (preserved)", after.SupersededBy, newOut.ID)
+	}
+}
+
+func TestHandleUpdateContent_DoesNotAutoSupersede(t *testing.T) {
+	emb := newStubEmbedder(4)
+	// Two facts that start with distinct embeddings.
+	emb.vectors["initial a"] = []float32{1, 0, 0, 0}
+	emb.vectors["initial b"] = []float32{0, 1, 0, 0}
+	// After update, fact-a's new content matches fact-b's embedding exactly,
+	// so conflict detection (if it ran) would supersede one with the other.
+	emb.vectors["matches b exactly"] = []float32{0, 1, 0, 0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, aOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "initial a", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite a: %v", err)
+	}
+	_, bOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "initial b", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite b: %v", err)
+	}
+
+	_, _, err = s.handleUpdateContent(ctx, nil, UpdateContentInput{
+		ID:      aOut.ID,
+		Content: "matches b exactly",
+	})
+	if err != nil {
+		t.Fatalf("handleUpdateContent: %v", err)
+	}
+
+	aPost, _ := s.store.GetFact(ctx, aOut.ID)
+	bPost, _ := s.store.GetFact(ctx, bOut.ID)
+	if aPost.SupersededBy != nil {
+		t.Errorf("fact a superseded_by = %v, want nil (update must not auto-supersede)", aPost.SupersededBy)
+	}
+	if bPost.SupersededBy != nil {
+		t.Errorf("fact b superseded_by = %v, want nil (update must not auto-supersede)", bPost.SupersededBy)
+	}
+}
+
+func TestHandleUpdateContent_EmptyID(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, err := s.handleUpdateContent(context.Background(), nil, UpdateContentInput{Content: "x"})
+	if err == nil || err.Error() != "id is required" {
+		t.Fatalf("err = %v, want 'id is required'", err)
+	}
+}

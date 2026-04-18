@@ -209,6 +209,21 @@ func (s *Server) registerTools(srv *mcpsdk.Server) {
 	}, s.handleMergeClusters)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_update_content",
+		Description: "Amend a fact's content or an episode's situation/action/outcome/preemptive fields in place. " +
+			"Re-embeds and re-hashes the memory but preserves its ID, cluster_id, created_at, valid_from, " +
+			"superseded_by, and (unless explicitly replaced) tags and episode links. " +
+			"Does NOT trigger conflict detection/supersede and does NOT reassign cluster — those are separate tools. " +
+			"Provide content (facts) OR episode (episodes), not both. tags is a tri-state: omit to preserve, empty array to clear. " +
+			"For episodes, linked_fact_ids follows the same tri-state convention.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:  readOnlyFalse,
+			OpenWorldHint: &openWorld,
+			Title:         "Update memory content",
+		},
+	}, s.handleUpdateContent)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name: "memory_decay_tick",
 		Description: "Advance the decay clock. Internal tool for session-end hooks and admin use. " +
 			"Not typically called by agents. Increments turns_since on all clusters.",

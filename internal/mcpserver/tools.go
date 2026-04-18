@@ -1418,6 +1418,196 @@ func (s *Server) handleMergeClusters(ctx context.Context, _ *mcpsdk.CallToolRequ
 	}, nil
 }
 
+// --- memory_update_content ---
+
+// UpdateContentInput is the input schema for the memory_update_content tool.
+//
+// Tags is a tri-state pointer: nil preserves the current tag set; a non-nil
+// pointer replaces it (an explicit empty slice clears tags). This mirrors the
+// Phase 2D spec.
+type UpdateContentInput struct {
+	ID      string          `json:"id" jsonschema:"fact or episode ID"`
+	Content string          `json:"content,omitempty" jsonschema:"new content (for facts)"`
+	Episode *EpisodePayload `json:"episode,omitempty" jsonschema:"new episode fields (for episodes); omit linked_fact_ids to preserve existing"`
+	Tags    *[]string       `json:"tags,omitempty" jsonschema:"replace tags; omit to preserve"`
+}
+
+// UpdateContentOutput is the output schema for the memory_update_content tool.
+type UpdateContentOutput struct {
+	ID         string `json:"id"`
+	Layer      string `json:"layer"`
+	Reembedded bool   `json:"reembedded"`
+}
+
+func (s *Server) handleUpdateContent(ctx context.Context, _ *mcpsdk.CallToolRequest, in UpdateContentInput) (*mcpsdk.CallToolResult, UpdateContentOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, UpdateContentOutput{}, nil
+	}
+
+	if in.ID == "" {
+		return nil, UpdateContentOutput{}, fmt.Errorf("id is required")
+	}
+
+	hasContent := in.Content != ""
+	hasEpisode := in.Episode != nil
+	hasTags := in.Tags != nil
+
+	// Both content and episode payloads simultaneously is nonsense (layer
+	// ambiguity).
+	if hasContent && hasEpisode {
+		return nil, UpdateContentOutput{}, fmt.Errorf("provide content OR episode, not both")
+	}
+	// No-op guard: caller supplied nothing to change.
+	if !hasContent && !hasEpisode && !hasTags {
+		return nil, UpdateContentOutput{}, fmt.Errorf("nothing to update: provide content, episode, or tags")
+	}
+
+	// Resolve ID: fact first, then episode. A superseded fact is allowed
+	// because update preserves superseded_by (operator may want to fix a typo
+	// in history).
+	fact, err := s.store.GetFact(ctx, in.ID)
+	if err != nil {
+		return nil, UpdateContentOutput{}, fmt.Errorf("get fact: %w", err)
+	}
+	if fact != nil {
+		if hasEpisode {
+			return nil, UpdateContentOutput{}, fmt.Errorf("layer mismatch: %s is a fact but episode payload was provided", in.ID)
+		}
+		return s.updateFactContent(ctx, fact, in)
+	}
+
+	ep, err := s.store.GetEpisode(ctx, in.ID)
+	if err != nil {
+		return nil, UpdateContentOutput{}, fmt.Errorf("get episode: %w", err)
+	}
+	if ep != nil {
+		if hasContent {
+			return nil, UpdateContentOutput{}, fmt.Errorf("layer mismatch: %s is an episode but content was provided", in.ID)
+		}
+		return s.updateEpisodeContent(ctx, ep, in)
+	}
+
+	return nil, UpdateContentOutput{}, fmt.Errorf("memory not found: %s", in.ID)
+}
+
+// updateFactContent handles the L2 fact amendment path. It re-embeds the new
+// content, hashes it, and delegates to Store.UpdateFactContent. It does NOT
+// reassign cluster and does NOT trigger conflict detection / supersede.
+func (s *Server) updateFactContent(ctx context.Context, existing *memory.Fact, in UpdateContentInput) (*mcpsdk.CallToolResult, UpdateContentOutput, error) {
+	// When tags are the only change, content is empty — keep the existing content.
+	newContent := existing.Content
+	if in.Content != "" {
+		newContent = in.Content
+	}
+
+	vecs, err := s.embedder.Embed(ctx, []string{newContent})
+	if err != nil {
+		return nil, UpdateContentOutput{}, fmt.Errorf("embed content: %w", err)
+	}
+	if len(vecs) == 0 || len(vecs[0]) == 0 {
+		return nil, UpdateContentOutput{}, fmt.Errorf("embedder returned empty vector")
+	}
+	vec := vecs[0]
+
+	h := sha256.Sum256([]byte(newContent))
+	contentHash := fmt.Sprintf("%x", h)
+
+	if err := s.store.UpdateFactContent(ctx, existing.ID, newContent, contentHash, vec, in.Tags); err != nil {
+		return nil, UpdateContentOutput{}, fmt.Errorf("update fact content: %w", err)
+	}
+
+	s.logger.Info("memory_update_content",
+		"id", existing.ID,
+		"layer", "l2_semantic",
+		"content_changed", in.Content != "",
+		"tags_changed", in.Tags != nil,
+	)
+	return nil, UpdateContentOutput{
+		ID:         existing.ID,
+		Layer:      string(memory.TypeL2Semantic),
+		Reembedded: true,
+	}, nil
+}
+
+// updateEpisodeContent handles the L3 episode amendment path. It re-embeds
+// the structured fields, hashes them, and delegates to Store.UpdateEpisodeContent.
+// Tags preservation is threaded through by copying the existing tag set when
+// in.Tags is nil. Linked fact IDs are replaced only when the caller set
+// ep.LinkedFactIDs explicitly (nil preserves, non-nil replaces, empty clears).
+func (s *Server) updateEpisodeContent(ctx context.Context, existing *memory.Episode, in UpdateContentInput) (*mcpsdk.CallToolResult, UpdateContentOutput, error) {
+	epIn := in.Episode
+
+	// Episode fields: caller supplies the full new tuple. We still accept the
+	// empty-string convention as "the caller wants empty here"; spec does not
+	// carve out partial updates for episodes.
+	newSituation := epIn.Situation
+	newAction := epIn.Action
+	newOutcome := epIn.Outcome
+	newPreemptive := epIn.Preemptive
+
+	// Match writeEpisode's join convention so re-embeds are self-consistent.
+	embedText := newSituation + "\n" + newAction + "\n" + newOutcome + "\n" + newPreemptive
+	vecs, err := s.embedder.Embed(ctx, []string{embedText})
+	if err != nil {
+		return nil, UpdateContentOutput{}, fmt.Errorf("embed episode: %w", err)
+	}
+	if len(vecs) == 0 || len(vecs[0]) == 0 {
+		return nil, UpdateContentOutput{}, fmt.Errorf("embedder returned empty vector")
+	}
+	vec := vecs[0]
+
+	h := sha256.Sum256([]byte(embedText))
+	contentHash := fmt.Sprintf("%x", h)
+
+	// Tags tri-state: translate from the pointer form to the concrete slice
+	// the store expects. When the pointer is nil, we pass the existing tag
+	// set through so normalizeTags yields the same rows.
+	var tagsForStore []string
+	if in.Tags != nil {
+		tagsForStore = *in.Tags
+	} else {
+		tagsForStore = existing.Tags
+	}
+
+	update := memory.Episode{
+		Situation:   newSituation,
+		Action:      newAction,
+		Outcome:     newOutcome,
+		Preemptive:  newPreemptive,
+		Embedding:   vec,
+		ContentHash: contentHash,
+		Tags:        tagsForStore,
+	}
+
+	if err := s.store.UpdateEpisodeContent(ctx, existing.ID, update); err != nil {
+		return nil, UpdateContentOutput{}, fmt.Errorf("update episode content: %w", err)
+	}
+
+	// Replace links only when the caller provided a non-nil slice. nil =
+	// preserve (no mutation), empty slice = clear.
+	linksChanged := false
+	if epIn.LinkedFactIDs != nil {
+		if err := s.store.ReplaceEpisodeLinks(ctx, existing.ID, epIn.LinkedFactIDs); err != nil {
+			return nil, UpdateContentOutput{}, fmt.Errorf("replace episode links: %w", err)
+		}
+		linksChanged = true
+	}
+
+	s.logger.Info("memory_update_content",
+		"id", existing.ID,
+		"layer", "l3_episodic",
+		"tags_changed", in.Tags != nil,
+		"links_changed", linksChanged,
+	)
+	return nil, UpdateContentOutput{
+		ID:         existing.ID,
+		Layer:      string(memory.TypeL3Episodic),
+		Reembedded: true,
+	}, nil
+}
+
 // --- memory_get ---
 
 // GetInput is the input schema for the memory_get tool.

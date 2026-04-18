@@ -154,6 +154,39 @@ type Store interface {
 	// Used by reindex after switching embedding models.
 	UpdateEpisodeEmbedding(ctx context.Context, id string, embedding []float32) error
 
+	// UpdateFactContent amends an L2 fact's content, content_hash, embedding,
+	// and (optionally) tags in place. accessed_at is bumped to
+	// time.Now().UTC(). ID, cluster_id, created_at, valid_from, source,
+	// confidence, subtype, and superseded_by are preserved.
+	//
+	// Tags semantics: a nil `tags` pointer preserves the existing tag set; a
+	// non-nil pointer replaces it — an empty (but non-nil) slice clears tags.
+	// Implementations normalize the replacement slice via normalizeTags.
+	//
+	// Returns an error if the fact does not exist.
+	UpdateFactContent(ctx context.Context, id, content, contentHash string, embedding []float32, tags *[]string) error
+
+	// UpdateEpisodeContent amends an L3 episode's situation/action/outcome/
+	// preemptive fields, embedding, content_hash, and (optionally) tags in
+	// place. accessed_at is bumped to time.Now().UTC(). ID, cluster_id, and
+	// created_at are preserved. Cross-type links are NOT touched here — the
+	// caller uses ReplaceEpisodeLinks for that.
+	//
+	// Tags semantics: the caller signals the tri-state via e.Tags. Because Go
+	// passes slices as (ptr, len, cap) the store cannot distinguish nil from
+	// empty on its own; the handler is responsible for leaving e.Tags as the
+	// existing tag set when preservation is desired, and for supplying a
+	// (possibly empty) slice when replacement is desired. Implementations
+	// normalize e.Tags via normalizeTags before writing.
+	UpdateEpisodeContent(ctx context.Context, id string, e Episode) error
+
+	// ReplaceEpisodeLinks deletes all fact_episode_links for the given
+	// episode and then inserts one row per factID. Callers pass an empty
+	// slice to clear links; nil is treated the same as empty (no rows).
+	// The handler is responsible for the "nil means preserve" convention —
+	// it should not call this method at all when no link change is wanted.
+	ReplaceEpisodeLinks(ctx context.Context, episodeID string, factIDs []string) error
+
 	// --- Temporal conflict resolution ---
 
 	// SupersedeFact sets the superseded_by field of the old fact to point to the

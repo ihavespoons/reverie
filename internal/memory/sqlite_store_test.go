@@ -1896,3 +1896,246 @@ func TestSQLiteMoveAllClusterMembers_IgnoresSuperseded(t *testing.T) {
 		t.Errorf("f2.ClusterID = %q, want dst", got2.ClusterID)
 	}
 }
+
+// --- Phase 2D: UpdateFactContent / UpdateEpisodeContent / ReplaceEpisodeLinks ---
+
+func TestSQLiteUpdateFactContent_HappyPath(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	f := testdataFacts()[0]
+	f.Tags = []string{"alpha", "beta"}
+	id, err := s.InsertFact(ctx, f)
+	if err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+	before, err := s.GetFact(ctx, id)
+	if err != nil {
+		t.Fatalf("GetFact before: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond) // RFC3339 1-second granularity
+
+	newTags := []string{"gamma"}
+	if err := s.UpdateFactContent(ctx, id, "new content", "newhash", []float32{0, 0, 1, 0}, &newTags); err != nil {
+		t.Fatalf("UpdateFactContent: %v", err)
+	}
+
+	after, err := s.GetFact(ctx, id)
+	if err != nil {
+		t.Fatalf("GetFact after: %v", err)
+	}
+	if after.Content != "new content" {
+		t.Errorf("Content = %q, want 'new content'", after.Content)
+	}
+	if after.ContentHash != "newhash" {
+		t.Errorf("ContentHash = %q, want newhash", after.ContentHash)
+	}
+	if len(after.Embedding) != 4 || after.Embedding[2] != 1 {
+		t.Errorf("Embedding = %v, want [0,0,1,0]", after.Embedding)
+	}
+	if len(after.Tags) != 1 || after.Tags[0] != "gamma" {
+		t.Errorf("Tags = %v, want [gamma]", after.Tags)
+	}
+	if !after.AccessedAt.After(before.AccessedAt) {
+		t.Errorf("AccessedAt not bumped: before=%v after=%v", before.AccessedAt, after.AccessedAt)
+	}
+	// Preserved fields.
+	if !after.CreatedAt.Equal(before.CreatedAt) {
+		t.Errorf("CreatedAt changed: before=%v after=%v", before.CreatedAt, after.CreatedAt)
+	}
+	if after.ClusterID != before.ClusterID {
+		t.Errorf("ClusterID changed: before=%q after=%q", before.ClusterID, after.ClusterID)
+	}
+	if !after.ValidFrom.Equal(before.ValidFrom) {
+		t.Errorf("ValidFrom changed: before=%v after=%v", before.ValidFrom, after.ValidFrom)
+	}
+}
+
+func TestSQLiteUpdateFactContent_TagsNilPreserves(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	f := testdataFacts()[0]
+	f.Tags = []string{"keep", "me"}
+	id, err := s.InsertFact(ctx, f)
+	if err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+
+	if err := s.UpdateFactContent(ctx, id, "updated", "h", []float32{1, 0, 0, 0}, nil); err != nil {
+		t.Fatalf("UpdateFactContent: %v", err)
+	}
+	got, err := s.GetFact(ctx, id)
+	if err != nil {
+		t.Fatalf("GetFact: %v", err)
+	}
+	if len(got.Tags) != 2 || got.Tags[0] != "keep" || got.Tags[1] != "me" {
+		t.Errorf("Tags = %v, want [keep me]", got.Tags)
+	}
+}
+
+func TestSQLiteUpdateFactContent_TagsEmptyClears(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	f := testdataFacts()[0]
+	f.Tags = []string{"will", "go"}
+	id, err := s.InsertFact(ctx, f)
+	if err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+
+	empty := []string{}
+	if err := s.UpdateFactContent(ctx, id, "updated", "h", []float32{1, 0, 0, 0}, &empty); err != nil {
+		t.Fatalf("UpdateFactContent: %v", err)
+	}
+	got, err := s.GetFact(ctx, id)
+	if err != nil {
+		t.Fatalf("GetFact: %v", err)
+	}
+	if len(got.Tags) != 0 {
+		t.Errorf("Tags = %v, want empty", got.Tags)
+	}
+}
+
+func TestSQLiteUpdateFactContent_NotFound(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+	err := s.UpdateFactContent(ctx, "ghost", "x", "y", []float32{1}, nil)
+	if err == nil {
+		t.Fatal("expected error for missing fact")
+	}
+	if !strings.Contains(err.Error(), "fact \"ghost\" not found") {
+		t.Errorf("err = %q, want it to mention missing fact", err)
+	}
+}
+
+func TestSQLiteUpdateEpisodeContent_HappyPath(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	ep := testdataEpisodes()[0]
+	ep.Tags = []string{"orig"}
+	id, err := s.InsertEpisode(ctx, ep)
+	if err != nil {
+		t.Fatalf("InsertEpisode: %v", err)
+	}
+	before, err := s.GetEpisode(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEpisode before: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+
+	updated := Episode{
+		Situation:   "newSit",
+		Action:      "newAct",
+		Outcome:     "newOut",
+		Preemptive:  "newPre",
+		Embedding:   []float32{0, 0, 1, 0},
+		ContentHash: "newhash",
+		Tags:        []string{"fresh"},
+	}
+	if err := s.UpdateEpisodeContent(ctx, id, updated); err != nil {
+		t.Fatalf("UpdateEpisodeContent: %v", err)
+	}
+
+	after, err := s.GetEpisode(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEpisode after: %v", err)
+	}
+	if after.Situation != "newSit" || after.Action != "newAct" || after.Outcome != "newOut" || after.Preemptive != "newPre" {
+		t.Errorf("episode fields = %+v, want the new values", after)
+	}
+	if after.ContentHash != "newhash" {
+		t.Errorf("ContentHash = %q, want newhash", after.ContentHash)
+	}
+	if len(after.Tags) != 1 || after.Tags[0] != "fresh" {
+		t.Errorf("Tags = %v, want [fresh]", after.Tags)
+	}
+	if !after.AccessedAt.After(before.AccessedAt) {
+		t.Errorf("AccessedAt not bumped: before=%v after=%v", before.AccessedAt, after.AccessedAt)
+	}
+	if !after.CreatedAt.Equal(before.CreatedAt) {
+		t.Errorf("CreatedAt changed: before=%v after=%v", before.CreatedAt, after.CreatedAt)
+	}
+}
+
+func TestSQLiteUpdateEpisodeContent_NotFound(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+	err := s.UpdateEpisodeContent(ctx, "ghost", Episode{Embedding: []float32{1}})
+	if err == nil {
+		t.Fatal("expected error for missing episode")
+	}
+	if !strings.Contains(err.Error(), "episode \"ghost\" not found") {
+		t.Errorf("err = %q, want it to mention missing episode", err)
+	}
+}
+
+func TestSQLiteReplaceEpisodeLinks(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	// Insert two facts and one episode linked to both.
+	f1 := testdataFacts()[0]
+	f1.Subtype = "project"
+	f2 := testdataFacts()[1]
+	f2.Subtype = "project"
+	f2.Content = "another fact"
+
+	id1, err := s.InsertFact(ctx, f1)
+	if err != nil {
+		t.Fatalf("InsertFact f1: %v", err)
+	}
+	id2, err := s.InsertFact(ctx, f2)
+	if err != nil {
+		t.Fatalf("InsertFact f2: %v", err)
+	}
+
+	ep := testdataEpisodes()[0]
+	ep.LinkedFactIDs = []string{id1}
+	epID, err := s.InsertEpisode(ctx, ep)
+	if err != nil {
+		t.Fatalf("InsertEpisode: %v", err)
+	}
+
+	// Replace: link to id2 instead of id1.
+	if err := s.ReplaceEpisodeLinks(ctx, epID, []string{id2}); err != nil {
+		t.Fatalf("ReplaceEpisodeLinks: %v", err)
+	}
+
+	got, err := s.GetEpisode(ctx, epID)
+	if err != nil {
+		t.Fatalf("GetEpisode: %v", err)
+	}
+	if len(got.LinkedFactIDs) != 1 || got.LinkedFactIDs[0] != id2 {
+		t.Errorf("links = %v, want [%s]", got.LinkedFactIDs, id2)
+	}
+
+	// Clearing via empty slice.
+	if err := s.ReplaceEpisodeLinks(ctx, epID, []string{}); err != nil {
+		t.Fatalf("ReplaceEpisodeLinks clear: %v", err)
+	}
+	got, err = s.GetEpisode(ctx, epID)
+	if err != nil {
+		t.Fatalf("GetEpisode after clear: %v", err)
+	}
+	if len(got.LinkedFactIDs) != 0 {
+		t.Errorf("links after clear = %v, want empty", got.LinkedFactIDs)
+	}
+
+	// nil slice also clears (documented in interface).
+	if err := s.ReplaceEpisodeLinks(ctx, epID, []string{id1, id2}); err != nil {
+		t.Fatalf("ReplaceEpisodeLinks repopulate: %v", err)
+	}
+	if err := s.ReplaceEpisodeLinks(ctx, epID, nil); err != nil {
+		t.Fatalf("ReplaceEpisodeLinks nil: %v", err)
+	}
+	got, err = s.GetEpisode(ctx, epID)
+	if err != nil {
+		t.Fatalf("GetEpisode after nil: %v", err)
+	}
+	if len(got.LinkedFactIDs) != 0 {
+		t.Errorf("links after nil replace = %v, want empty", got.LinkedFactIDs)
+	}
+}
