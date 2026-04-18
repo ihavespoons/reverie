@@ -246,6 +246,7 @@ func (s *Server) writeEpisode(ctx context.Context, in WriteInput) (*mcpsdk.CallT
 		ContentHash:   contentHash,
 		Embedding:     vec,
 		LinkedFactIDs: ep.LinkedFactIDs,
+		Tags:          in.Tags,
 	}
 
 	id, err := s.store.InsertEpisode(ctx, episode)
@@ -303,6 +304,7 @@ func (s *Server) writeFact(ctx context.Context, in WriteInput) (*mcpsdk.CallTool
 		Source:      source,
 		Embedding:   vec,
 		Confidence:  1.0,
+		Tags:        in.Tags,
 	}
 
 	// Conflict detection: find near-duplicate facts in the same subtype.
@@ -650,9 +652,9 @@ func (s *Server) handleApplyJudgment(ctx context.Context, _ *mcpsdk.CallToolRequ
 	// scoredCandidate holds a candidate that passed the gate filter along with
 	// its composite score for ranking.
 	type scoredCandidate struct {
-		candidate  memory.Candidate
-		retention  float64
-		composite  float64
+		candidate memory.Candidate
+		retention float64
+		composite float64
 	}
 
 	var passed []scoredCandidate

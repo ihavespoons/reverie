@@ -1709,3 +1709,111 @@ func TestMemoryUpdateCluster_EmptyClusterID(t *testing.T) {
 		t.Fatal("expected error for empty cluster_id")
 	}
 }
+
+// --- Tag wiring tests (Phase 1D) ---
+
+// TestHandleWrite_FactTagsPersisted verifies WriteInput.Tags is forwarded to
+// the persisted Fact.Tags (previously dropped silently) and survives round
+// trip through the store.
+func TestHandleWrite_FactTagsPersisted(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["tagged fact"] = []float32{0.4, 0.4, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, out, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "tagged fact",
+		Type:    "project",
+		Tags:    []string{"Go", "phase-1", "go"}, // mixed case + dup
+	})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+	if out.ID == "" {
+		t.Fatal("expected non-empty id")
+	}
+
+	f, err := s.store.GetFact(ctx, out.ID)
+	if err != nil {
+		t.Fatalf("GetFact: %v", err)
+	}
+	if f == nil {
+		t.Fatal("fact not found")
+	}
+	if len(f.Tags) != 2 {
+		t.Fatalf("expected 2 normalized tags, got %d: %v", len(f.Tags), f.Tags)
+	}
+	// Normalization: lowercased, deduped, sorted.
+	if f.Tags[0] != "go" || f.Tags[1] != "phase-1" {
+		t.Errorf("tags = %v, want [go phase-1]", f.Tags)
+	}
+}
+
+// TestHandleWrite_EpisodeTagsPersisted exercises the same wiring for L3.
+func TestHandleWrite_EpisodeTagsPersisted(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, out, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Tags: []string{"learning", "refactor"},
+		Episode: &EpisodePayload{
+			Situation:  "tests were flaky",
+			Action:     "injected clock",
+			Outcome:    "tests deterministic",
+			Preemptive: "use injected clocks",
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+	if out.Layer != "l3_episodic" {
+		t.Fatalf("layer = %q, want l3_episodic", out.Layer)
+	}
+
+	ep, err := s.store.GetEpisode(ctx, out.ID)
+	if err != nil {
+		t.Fatalf("GetEpisode: %v", err)
+	}
+	if ep == nil {
+		t.Fatal("episode not found")
+	}
+	if len(ep.Tags) != 2 || ep.Tags[0] != "learning" || ep.Tags[1] != "refactor" {
+		t.Errorf("tags = %v, want [learning refactor]", ep.Tags)
+	}
+}
+
+// TestHandleWrite_FactTagsListable verifies a tagged fact comes back through
+// the store's ListFacts with TagsAny filter — the read-path that 1A will
+// surface in memory_list. Exercised here to guard the end-to-end behavior
+// before 1A's tool-level changes land.
+func TestHandleWrite_FactTagsListable(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["listable fact"] = []float32{0.3, 0.3, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, _, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "listable fact",
+		Type:    "project",
+		Tags:    []string{"smoke"},
+	})
+	if err != nil {
+		t.Fatalf("handleWrite: %v", err)
+	}
+
+	got, err := s.store.ListFacts(ctx, memory.ListFilter{TagsAny: []string{"smoke"}})
+	if err != nil {
+		t.Fatalf("ListFacts: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListFacts tags_any=[smoke] returned %d, want 1", len(got))
+	}
+	if got[0].Content != "listable fact" {
+		t.Errorf("content = %q, want 'listable fact'", got[0].Content)
+	}
+}
