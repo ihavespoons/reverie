@@ -54,7 +54,7 @@ type Decay struct {
 //     BaseURL ignored.
 type Embedding struct {
 	Provider   string `toml:"provider"`
-	BaseURL    string `toml:"base_url"`   // openai_compat only
+	BaseURL    string `toml:"base_url"` // openai_compat only
 	Model      string `toml:"model"`
 	BatchSize  int    `toml:"batch_size"`
 	Dimensions int    `toml:"dimensions"` // model's embedding dim; advisory
@@ -126,8 +126,8 @@ func Defaults() *Config {
 // Environment overrides:
 //   - VOYAGE_API_KEY       -> Embedding.APIKey (when provider is "voyage")
 //   - OPENAI_API_KEY       -> Embedding.APIKey (when provider is "openai_compat"
-//                             and VOYAGE_API_KEY is unset); optional for Ollama
-//                             and LM Studio which ignore the bearer token
+//     and VOYAGE_API_KEY is unset); optional for Ollama
+//     and LM Studio which ignore the bearer token
 //   - REVERIE_EMBED_URL    -> Embedding.BaseURL (for openai_compat)
 //   - REVERIE_EMBED_MODEL  -> Embedding.Model
 //   - REVERIE_DB_PATH      -> Storage.DBPath

@@ -16,8 +16,8 @@ type fakeStore struct {
 	clusters map[string]memory.ClusterNode
 
 	// Track calls for assertions.
-	createCalls          []memory.ClusterNode
-	updateCentroidCalls  []centroidUpdate
+	createCalls         []memory.ClusterNode
+	updateCentroidCalls []centroidUpdate
 }
 
 type centroidUpdate struct {

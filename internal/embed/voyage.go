@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	voyageAPIURL      = "https://api.voyageai.com/v1/embeddings"
+	voyageAPIURL       = "https://api.voyageai.com/v1/embeddings"
 	voyageDefaultModel = "voyage-3"
 	voyageMaxBatch     = 128
 )

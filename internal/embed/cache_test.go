@@ -31,7 +31,6 @@ func (f *fakeProvider) Embed(_ context.Context, texts []string) ([][]float32, er
 func (f *fakeProvider) Dimensions() int { return f.dim }
 func (f *fakeProvider) Model() string   { return f.model }
 
-
 func TestCachePopulatesOnFirstCall(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	d, err := db.Open(dbPath)
