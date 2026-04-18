@@ -2669,6 +2669,344 @@ func TestHandleReassignCluster_LastMemberRemovedFromL1Index(t *testing.T) {
 	}
 }
 
+// seedThreeInOneCluster writes three facts with near-identical embeddings so
+// they all land in a single cluster. Different subtypes are used to avoid
+// conflict-based supersede (which would cull near-duplicate facts of the same
+// subtype).
+func seedThreeInOneCluster(t *testing.T, s *Server, emb *stubEmbedder) (ids [3]string, clusterID string) {
+	t.Helper()
+	ctx := context.Background()
+
+	emb.vectors["split fact 1"] = []float32{1, 0, 0, 0}
+	emb.vectors["split fact 2"] = []float32{0.99, 0.01, 0, 0}
+	emb.vectors["split fact 3"] = []float32{0.98, 0.02, 0, 0}
+
+	_, out1, err := s.handleWrite(ctx, nil, WriteInput{Content: "split fact 1", Type: "project"})
+	if err != nil {
+		t.Fatalf("write 1: %v", err)
+	}
+	_, out2, err := s.handleWrite(ctx, nil, WriteInput{Content: "split fact 2", Type: "user"})
+	if err != nil {
+		t.Fatalf("write 2: %v", err)
+	}
+	_, out3, err := s.handleWrite(ctx, nil, WriteInput{Content: "split fact 3", Type: "feedback"})
+	if err != nil {
+		t.Fatalf("write 3: %v", err)
+	}
+
+	f1, _ := s.store.GetFact(ctx, out1.ID)
+	f2, _ := s.store.GetFact(ctx, out2.ID)
+	f3, _ := s.store.GetFact(ctx, out3.ID)
+	if f1.ClusterID != f2.ClusterID || f2.ClusterID != f3.ClusterID {
+		t.Fatalf("expected all three facts in one cluster; got %s, %s, %s",
+			f1.ClusterID, f2.ClusterID, f3.ClusterID)
+	}
+	return [3]string{out1.ID, out2.ID, out3.ID}, f1.ClusterID
+}
+
+func TestHandleSplitCluster_FullPartition(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	ids, clusterID := seedThreeInOneCluster(t, s, emb)
+
+	_, out, err := s.handleSplitCluster(ctx, nil, SplitClusterInput{
+		ClusterID: clusterID,
+		Groups: [][]string{
+			{ids[0], ids[1]},
+			{ids[2]},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleSplitCluster: %v", err)
+	}
+
+	if out.SourceClusterID != clusterID {
+		t.Errorf("SourceClusterID = %q, want %q", out.SourceClusterID, clusterID)
+	}
+	if len(out.NewClusterIDs) != 2 {
+		t.Fatalf("NewClusterIDs len = %d, want 2", len(out.NewClusterIDs))
+	}
+	if !out.SourceDeleted {
+		t.Errorf("SourceDeleted = false, want true")
+	}
+	if out.RemainingInSource != 0 {
+		t.Errorf("RemainingInSource = %d, want 0", out.RemainingInSource)
+	}
+
+	// Source cluster should be gone.
+	cl, err := s.store.GetCluster(ctx, clusterID)
+	if err != nil {
+		t.Fatalf("GetCluster source: %v", err)
+	}
+	if cl != nil {
+		t.Errorf("source cluster still present after full partition: %+v", cl)
+	}
+
+	// Each new cluster has the expected members with the right cluster_id.
+	f0, _ := s.store.GetFact(ctx, ids[0])
+	f1, _ := s.store.GetFact(ctx, ids[1])
+	f2, _ := s.store.GetFact(ctx, ids[2])
+	if f0.ClusterID != out.NewClusterIDs[0] || f1.ClusterID != out.NewClusterIDs[0] {
+		t.Errorf("group 0 members in wrong cluster: f0=%s f1=%s want=%s",
+			f0.ClusterID, f1.ClusterID, out.NewClusterIDs[0])
+	}
+	if f2.ClusterID != out.NewClusterIDs[1] {
+		t.Errorf("group 1 member in wrong cluster: f2=%s want=%s",
+			f2.ClusterID, out.NewClusterIDs[1])
+	}
+
+	// New cluster rows exist and item_counts are correct.
+	newA, err := s.store.GetCluster(ctx, out.NewClusterIDs[0])
+	if err != nil || newA == nil {
+		t.Fatalf("GetCluster newA: %v, nil=%v", err, newA == nil)
+	}
+	if newA.ItemCount != 2 {
+		t.Errorf("newA.ItemCount = %d, want 2", newA.ItemCount)
+	}
+	newB, err := s.store.GetCluster(ctx, out.NewClusterIDs[1])
+	if err != nil || newB == nil {
+		t.Fatalf("GetCluster newB: %v, nil=%v", err, newB == nil)
+	}
+	if newB.ItemCount != 1 {
+		t.Errorf("newB.ItemCount = %d, want 1", newB.ItemCount)
+	}
+}
+
+func TestHandleSplitCluster_PartialSplit(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	ids, clusterID := seedThreeInOneCluster(t, s, emb)
+
+	// Only partition two of the three members; one stays behind.
+	_, out, err := s.handleSplitCluster(ctx, nil, SplitClusterInput{
+		ClusterID: clusterID,
+		Groups: [][]string{
+			{ids[0]},
+			{ids[1]},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleSplitCluster: %v", err)
+	}
+	if out.SourceDeleted {
+		t.Errorf("SourceDeleted = true, want false (one member left behind)")
+	}
+	if out.RemainingInSource != 1 {
+		t.Errorf("RemainingInSource = %d, want 1", out.RemainingInSource)
+	}
+
+	// Source cluster still exists, with one member.
+	cl, err := s.store.GetCluster(ctx, clusterID)
+	if err != nil {
+		t.Fatalf("GetCluster source: %v", err)
+	}
+	if cl == nil {
+		t.Fatal("source cluster deleted, but it should still have one member")
+	}
+	if cl.ItemCount != 1 {
+		t.Errorf("source cluster ItemCount = %d, want 1", cl.ItemCount)
+	}
+
+	// The stray member is still in source.
+	f2, _ := s.store.GetFact(ctx, ids[2])
+	if f2.ClusterID != clusterID {
+		t.Errorf("ids[2] ClusterID = %q, want %q (source)", f2.ClusterID, clusterID)
+	}
+}
+
+func TestHandleSplitCluster_OverlappingGroups(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	ids, clusterID := seedThreeInOneCluster(t, s, emb)
+
+	before, err := s.store.ListClusters(ctx)
+	if err != nil {
+		t.Fatalf("ListClusters before: %v", err)
+	}
+
+	_, _, err = s.handleSplitCluster(ctx, nil, SplitClusterInput{
+		ClusterID: clusterID,
+		Groups: [][]string{
+			{ids[0], ids[1]},
+			{ids[1], ids[2]}, // ids[1] overlaps
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for overlapping groups")
+	}
+	if !strings.Contains(err.Error(), "more than one group") {
+		t.Errorf("error = %q, want substring 'more than one group'", err)
+	}
+
+	// The error path may have created a new cluster row before detecting the
+	// overlap (validation happens per-group in two passes) — but in this
+	// implementation, validation runs fully before any mutation, so the
+	// cluster list must be unchanged.
+	after, err := s.store.ListClusters(ctx)
+	if err != nil {
+		t.Fatalf("ListClusters after: %v", err)
+	}
+	if len(before) != len(after) {
+		t.Errorf("cluster list changed after failed split: before=%d after=%d", len(before), len(after))
+	}
+
+	// Members should still all be in the original cluster.
+	for i, id := range ids {
+		f, _ := s.store.GetFact(ctx, id)
+		if f.ClusterID != clusterID {
+			t.Errorf("ids[%d] ClusterID = %q, want %q after failed split", i, f.ClusterID, clusterID)
+		}
+	}
+}
+
+func TestHandleSplitCluster_EmptyGroup(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	ids, clusterID := seedThreeInOneCluster(t, s, emb)
+
+	_, _, err := s.handleSplitCluster(ctx, nil, SplitClusterInput{
+		ClusterID: clusterID,
+		Groups: [][]string{
+			{ids[0]},
+			{}, // empty
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for empty group")
+	}
+	if !strings.Contains(err.Error(), "group 1 is empty") {
+		t.Errorf("error = %q, want substring 'group 1 is empty'", err)
+	}
+}
+
+func TestHandleSplitCluster_IDNotInSource(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	ids, clusterID := seedThreeInOneCluster(t, s, emb)
+
+	// Seed a separate cluster with one member.
+	emb.vectors["unrelated fact"] = []float32{0, 1, 0, 0}
+	_, outOther, err := s.handleWrite(ctx, nil, WriteInput{Content: "unrelated fact", Type: "project"})
+	if err != nil {
+		t.Fatalf("write unrelated: %v", err)
+	}
+	otherFact, _ := s.store.GetFact(ctx, outOther.ID)
+	if otherFact.ClusterID == clusterID {
+		t.Fatalf("expected unrelated fact in separate cluster; both in %s", clusterID)
+	}
+
+	_, _, err = s.handleSplitCluster(ctx, nil, SplitClusterInput{
+		ClusterID: clusterID,
+		Groups: [][]string{
+			{ids[0], outOther.ID}, // outOther is not in source cluster
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for non-member ID")
+	}
+	if !strings.Contains(err.Error(), "not a member of cluster") {
+		t.Errorf("error = %q, want substring 'not a member of cluster'", err)
+	}
+}
+
+func TestHandleSplitCluster_MetasApplied(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	ids, clusterID := seedThreeInOneCluster(t, s, emb)
+
+	_, out, err := s.handleSplitCluster(ctx, nil, SplitClusterInput{
+		ClusterID: clusterID,
+		Groups: [][]string{
+			{ids[0], ids[1]},
+			{ids[2]},
+		},
+		Metas: []ClusterMeta{
+			{Summary: "group A summary", Domain: "domain-a", MetaInstr: "instr-a"},
+			{Summary: "group B summary", Domain: "domain-b", MetaInstr: "instr-b"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleSplitCluster: %v", err)
+	}
+
+	clA, err := s.store.GetCluster(ctx, out.NewClusterIDs[0])
+	if err != nil || clA == nil {
+		t.Fatalf("GetCluster A: %v, nil=%v", err, clA == nil)
+	}
+	if clA.Summary != "group A summary" || clA.Domain != "domain-a" || clA.MetaInstr != "instr-a" {
+		t.Errorf("cluster A meta = %+v, want summary/domain/instr = group A summary/domain-a/instr-a",
+			clA)
+	}
+	clB, err := s.store.GetCluster(ctx, out.NewClusterIDs[1])
+	if err != nil || clB == nil {
+		t.Fatalf("GetCluster B: %v, nil=%v", err, clB == nil)
+	}
+	if clB.Summary != "group B summary" || clB.Domain != "domain-b" || clB.MetaInstr != "instr-b" {
+		t.Errorf("cluster B meta = %+v, want summary/domain/instr = group B summary/domain-b/instr-b",
+			clB)
+	}
+}
+
+func TestHandleSplitCluster_MetasLengthMismatch(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	ids, clusterID := seedThreeInOneCluster(t, s, emb)
+
+	_, _, err := s.handleSplitCluster(ctx, nil, SplitClusterInput{
+		ClusterID: clusterID,
+		Groups: [][]string{
+			{ids[0]},
+			{ids[1]},
+		},
+		Metas: []ClusterMeta{{Summary: "only one"}}, // length 1 but 2 groups
+	})
+	if err == nil {
+		t.Fatal("expected error for metas length mismatch")
+	}
+	if !strings.Contains(err.Error(), "metas length") {
+		t.Errorf("error = %q, want substring 'metas length'", err)
+	}
+}
+
+func TestHandleSplitCluster_ClusterNotFound(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, _, err := s.handleSplitCluster(ctx, nil, SplitClusterInput{
+		ClusterID: "ghost-cluster",
+		Groups:    [][]string{{"some-id"}},
+	})
+	if err == nil {
+		t.Fatal("expected error for missing source cluster")
+	}
+	if !strings.Contains(err.Error(), "cluster not found: ghost-cluster") {
+		t.Errorf("error = %q, want substring 'cluster not found: ghost-cluster'", err)
+	}
+}
+
 // vectorsEqual reports whether two float32 slices are exactly equal.
 func vectorsEqual(a, b []float32) bool {
 	if len(a) != len(b) {

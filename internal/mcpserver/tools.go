@@ -986,6 +986,206 @@ func (s *Server) handleReassignCluster(ctx context.Context, _ *mcpsdk.CallToolRe
 	}, nil
 }
 
+// --- memory_split_cluster ---
+
+// ClusterMeta carries optional L1 metadata to apply to each new cluster
+// created by memory_split_cluster. All fields are optional.
+type ClusterMeta struct {
+	Summary   string `json:"summary,omitempty"`
+	Domain    string `json:"domain,omitempty"`
+	MetaInstr string `json:"meta_instr,omitempty"`
+}
+
+// SplitClusterInput is the input schema for the memory_split_cluster tool.
+type SplitClusterInput struct {
+	ClusterID string        `json:"cluster_id" jsonschema:"cluster to split (must exist)"`
+	Groups    [][]string    `json:"groups" jsonschema:"non-overlapping partitions; each group becomes a new cluster"`
+	Metas     []ClusterMeta `json:"metas,omitempty" jsonschema:"optional metadata for each new cluster (summary, domain, meta_instr). Must be same length as groups if provided."`
+}
+
+// SplitClusterOutput is the output schema for the memory_split_cluster tool.
+type SplitClusterOutput struct {
+	SourceClusterID   string   `json:"source_cluster_id"`
+	NewClusterIDs     []string `json:"new_cluster_ids"`
+	SourceDeleted     bool     `json:"source_deleted"`
+	RemainingInSource int      `json:"remaining_in_source"`
+}
+
+// handleSplitCluster partitions a source cluster's members into one or more
+// new clusters based on explicit ID groups. Any members not appearing in a
+// group remain in the source. If all members are partitioned, the source is
+// deleted; otherwise its centroid is recomputed.
+//
+// The operation is not currently wrapped in a transaction — steps are executed
+// sequentially. A future pass (once Phase 2B's withTx helper is available) can
+// rewrap for full all-or-nothing atomicity.
+func (s *Server) handleSplitCluster(ctx context.Context, _ *mcpsdk.CallToolRequest, in SplitClusterInput) (*mcpsdk.CallToolResult, SplitClusterOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, SplitClusterOutput{}, nil
+	}
+
+	if in.ClusterID == "" {
+		return nil, SplitClusterOutput{}, fmt.Errorf("cluster_id is required")
+	}
+	if len(in.Groups) == 0 {
+		return nil, SplitClusterOutput{}, fmt.Errorf("groups is required and must not be empty")
+	}
+	if len(in.Metas) > 0 && len(in.Metas) != len(in.Groups) {
+		return nil, SplitClusterOutput{}, fmt.Errorf("metas length (%d) must match groups length (%d)", len(in.Metas), len(in.Groups))
+	}
+
+	// Validate source cluster exists.
+	source, err := s.store.GetCluster(ctx, in.ClusterID)
+	if err != nil {
+		return nil, SplitClusterOutput{}, fmt.Errorf("get source cluster: %w", err)
+	}
+	if source == nil {
+		return nil, SplitClusterOutput{}, fmt.Errorf("cluster not found: %s", in.ClusterID)
+	}
+
+	// Build the source membership set once: all non-superseded fact IDs plus
+	// all episode IDs currently in the cluster. Paged to keep memory bounded
+	// on large clusters.
+	membership, err := s.collectClusterMembership(ctx, in.ClusterID)
+	if err != nil {
+		return nil, SplitClusterOutput{}, err
+	}
+
+	// Validate groups: non-empty, no overlap across groups, every member is
+	// in the source cluster. Build the union set so we can compute "remaining".
+	union := make(map[string]struct{})
+	for i, g := range in.Groups {
+		if len(g) == 0 {
+			return nil, SplitClusterOutput{}, fmt.Errorf("group %d is empty", i)
+		}
+		for _, id := range g {
+			if _, ok := membership[id]; !ok {
+				return nil, SplitClusterOutput{}, fmt.Errorf("memory %s not a member of cluster %s", id, in.ClusterID)
+			}
+			if _, dup := union[id]; dup {
+				return nil, SplitClusterOutput{}, fmt.Errorf("memory %s appears in more than one group", id)
+			}
+			union[id] = struct{}{}
+		}
+	}
+
+	// For each group, create a new cluster and reparent its members.
+	newClusterIDs := make([]string, len(in.Groups))
+	for i, g := range in.Groups {
+		newID := uuid.New().String()
+
+		node := memory.ClusterNode{ID: newID}
+		if i < len(in.Metas) {
+			node.Summary = in.Metas[i].Summary
+			node.Domain = in.Metas[i].Domain
+			node.MetaInstr = in.Metas[i].MetaInstr
+		}
+		if err := s.store.CreateCluster(ctx, node); err != nil {
+			return nil, SplitClusterOutput{}, fmt.Errorf("create new cluster for group %d: %w", i, err)
+		}
+
+		// Reparent each member. SetMemoryCluster also bumps accessed_at.
+		for _, memID := range g {
+			if err := s.store.SetMemoryCluster(ctx, memID, newID); err != nil {
+				return nil, SplitClusterOutput{}, fmt.Errorf("reassign %s to new cluster: %w", memID, err)
+			}
+		}
+
+		// Recompute the new cluster's centroid from its fresh membership.
+		if err := memory.RecomputeCentroid(ctx, s.store, newID); err != nil && err != memory.ErrEmptyCluster {
+			return nil, SplitClusterOutput{}, fmt.Errorf("recompute centroid for new cluster %d: %w", i, err)
+		}
+
+		newClusterIDs[i] = newID
+	}
+
+	// Compute remaining members of the source (membership minus union of groups).
+	remaining := len(membership) - len(union)
+
+	// Handle the source cluster: delete if fully partitioned, otherwise
+	// recompute its centroid with the survivors.
+	sourceDeleted := false
+	if remaining == 0 {
+		if err := s.store.DeleteCluster(ctx, in.ClusterID); err != nil {
+			return nil, SplitClusterOutput{}, fmt.Errorf("delete source cluster: %w", err)
+		}
+		sourceDeleted = true
+	} else {
+		if err := memory.RecomputeCentroid(ctx, s.store, in.ClusterID); err != nil && err != memory.ErrEmptyCluster {
+			return nil, SplitClusterOutput{}, fmt.Errorf("recompute source centroid: %w", err)
+		}
+	}
+
+	// Treat each new cluster as accessed — reset turns_since=0. Matches the
+	// pattern used by handleReassignCluster and handleWrite.
+	if err := s.mgr.TickDecay(ctx, newClusterIDs); err != nil {
+		s.logger.Warn("memory_split_cluster: tick decay failed", "err", err)
+	}
+
+	s.logger.Info("memory_split_cluster",
+		"source_cluster_id", in.ClusterID,
+		"groups", len(in.Groups),
+		"new_cluster_ids", newClusterIDs,
+		"source_deleted", sourceDeleted,
+		"remaining_in_source", remaining,
+	)
+
+	return nil, SplitClusterOutput{
+		SourceClusterID:   in.ClusterID,
+		NewClusterIDs:     newClusterIDs,
+		SourceDeleted:     sourceDeleted,
+		RemainingInSource: remaining,
+	}, nil
+}
+
+// collectClusterMembership returns the set of all member IDs (facts and
+// episodes) of a cluster. Pages through ListFactsByCluster /
+// ListEpisodesByCluster to stay bounded in memory on large clusters.
+func (s *Server) collectClusterMembership(ctx context.Context, clusterID string) (map[string]struct{}, error) {
+	const pageSize = 200
+	members := make(map[string]struct{})
+
+	offset := 0
+	for {
+		facts, err := s.store.ListFactsByCluster(ctx, clusterID, pageSize, offset)
+		if err != nil {
+			return nil, fmt.Errorf("list facts by cluster: %w", err)
+		}
+		if len(facts) == 0 {
+			break
+		}
+		for i := range facts {
+			members[facts[i].ID] = struct{}{}
+		}
+		if len(facts) < pageSize {
+			break
+		}
+		offset += len(facts)
+	}
+
+	offset = 0
+	for {
+		episodes, err := s.store.ListEpisodesByCluster(ctx, clusterID, pageSize, offset)
+		if err != nil {
+			return nil, fmt.Errorf("list episodes by cluster: %w", err)
+		}
+		if len(episodes) == 0 {
+			break
+		}
+		for i := range episodes {
+			members[episodes[i].ID] = struct{}{}
+		}
+		if len(episodes) < pageSize {
+			break
+		}
+		offset += len(episodes)
+	}
+
+	return members, nil
+}
+
 // --- memory_get ---
 
 // GetInput is the input schema for the memory_get tool.

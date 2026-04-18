@@ -183,6 +183,20 @@ func (s *Server) registerTools(srv *mcpsdk.Server) {
 	}, s.handleReassignCluster)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_split_cluster",
+		Description: "Partition a cluster's members into new clusters by explicit ID groups. " +
+			"Each group becomes a new cluster; optional Metas[] provides summary/domain/meta_instr per group. " +
+			"Members not listed in any group remain in the source cluster. " +
+			"If every member is partitioned the source cluster is deleted; otherwise its centroid is recomputed. " +
+			"Groups must be non-empty and non-overlapping, and every listed ID must currently be a member of the source cluster.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:  readOnlyFalse,
+			OpenWorldHint: &openWorld,
+			Title:         "Split cluster into new clusters",
+		},
+	}, s.handleSplitCluster)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name: "memory_decay_tick",
 		Description: "Advance the decay clock. Internal tool for session-end hooks and admin use. " +
 			"Not typically called by agents. Increments turns_since on all clusters.",
