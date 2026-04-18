@@ -197,6 +197,18 @@ func (s *Server) registerTools(srv *mcpsdk.Server) {
 	}, s.handleSplitCluster)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_merge_clusters",
+		Description: "Merge N source clusters into a single target cluster. Every non-superseded fact and every episode in each source is reparented to the target; the source clusters are then deleted. " +
+			"Member IDs are preserved so supersede chains and episode links stay intact. The target's centroid is recomputed from its new membership. " +
+			"Errors if the target is listed as a source, if the source list is empty, or if any source or the target does not exist.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:  readOnlyFalse,
+			OpenWorldHint: &openWorld,
+			Title:         "Merge clusters",
+		},
+	}, s.handleMergeClusters)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name: "memory_decay_tick",
 		Description: "Advance the decay clock. Internal tool for session-end hooks and admin use. " +
 			"Not typically called by agents. Increments turns_since on all clusters.",

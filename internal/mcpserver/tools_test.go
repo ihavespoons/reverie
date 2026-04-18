@@ -3019,3 +3019,272 @@ func vectorsEqual(a, b []float32) bool {
 	}
 	return true
 }
+
+// --- memory_merge_clusters tests ---
+
+// seedThreeClusters writes three orthogonal facts so each lands in its own
+// cluster. Returns the fact IDs and cluster IDs in (a, b, c) order.
+func seedThreeClusters(t *testing.T, s *Server, emb *stubEmbedder) (aID, clusterA, bID, clusterB, cID, clusterC string) {
+	t.Helper()
+	ctx := context.Background()
+
+	emb.vectors["fact a"] = []float32{1, 0, 0, 0}
+	emb.vectors["fact b"] = []float32{0, 1, 0, 0}
+	emb.vectors["fact c"] = []float32{0, 0, 1, 0}
+
+	_, aOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact a", Type: "project"})
+	if err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	_, bOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact b", Type: "project"})
+	if err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	_, cOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact c", Type: "project"})
+	if err != nil {
+		t.Fatalf("write c: %v", err)
+	}
+
+	fa, err := s.store.GetFact(ctx, aOut.ID)
+	if err != nil || fa == nil {
+		t.Fatalf("GetFact a: %v", err)
+	}
+	fb, err := s.store.GetFact(ctx, bOut.ID)
+	if err != nil || fb == nil {
+		t.Fatalf("GetFact b: %v", err)
+	}
+	fc, err := s.store.GetFact(ctx, cOut.ID)
+	if err != nil || fc == nil {
+		t.Fatalf("GetFact c: %v", err)
+	}
+	if fa.ClusterID == fb.ClusterID || fa.ClusterID == fc.ClusterID || fb.ClusterID == fc.ClusterID {
+		t.Fatalf("expected 3 distinct clusters; got a=%s b=%s c=%s", fa.ClusterID, fb.ClusterID, fc.ClusterID)
+	}
+	return aOut.ID, fa.ClusterID, bOut.ID, fb.ClusterID, cOut.ID, fc.ClusterID
+}
+
+func TestHandleMergeClusters_TwoSourcesIntoTarget(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	aID, clusterA, bID, clusterB, cID, clusterC := seedThreeClusters(t, s, emb)
+
+	// Grab target's pre-merge centroid for a before/after comparison.
+	preC, _ := s.store.GetCluster(ctx, clusterC)
+
+	_, out, err := s.handleMergeClusters(ctx, nil, MergeClustersInput{
+		SourceClusterIDs: []string{clusterA, clusterB},
+		TargetClusterID:  clusterC,
+	})
+	if err != nil {
+		t.Fatalf("handleMergeClusters: %v", err)
+	}
+	if out.TargetClusterID != clusterC {
+		t.Errorf("TargetClusterID = %q, want %q", out.TargetClusterID, clusterC)
+	}
+	if out.MergedCount != 2 {
+		t.Errorf("MergedCount = %d, want 2", out.MergedCount)
+	}
+	if len(out.DeletedClusters) != 2 {
+		t.Errorf("DeletedClusters = %v, want length 2", out.DeletedClusters)
+	}
+	if out.NewItemCount != 3 {
+		t.Errorf("NewItemCount = %d, want 3", out.NewItemCount)
+	}
+
+	// All three facts now live in clusterC.
+	for _, id := range []string{aID, bID, cID} {
+		f, err := s.store.GetFact(ctx, id)
+		if err != nil || f == nil {
+			t.Fatalf("GetFact %s: %v", id, err)
+		}
+		if f.ClusterID != clusterC {
+			t.Errorf("fact %s in cluster %q, want %q", id, f.ClusterID, clusterC)
+		}
+	}
+
+	// Source clusters gone.
+	for _, src := range []string{clusterA, clusterB} {
+		got, err := s.store.GetCluster(ctx, src)
+		if err != nil {
+			t.Fatalf("GetCluster %s: %v", src, err)
+		}
+		if got != nil {
+			t.Errorf("source cluster %s still present after merge: %+v", src, got)
+		}
+	}
+
+	// l1/index no longer lists source clusters.
+	req := &mcpsdk.ReadResourceRequest{}
+	req.Params = &mcpsdk.ReadResourceParams{URI: "reverie://l1/index"}
+	res, err := s.handleL1IndexResource(ctx, req)
+	if err != nil {
+		t.Fatalf("handleL1IndexResource: %v", err)
+	}
+	var index l1IndexResponse
+	if err := json.Unmarshal([]byte(res.Contents[0].Text), &index); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, cl := range index.Clusters {
+		if cl.ID == clusterA || cl.ID == clusterB {
+			t.Errorf("l1/index still lists deleted source %q", cl.ID)
+		}
+	}
+
+	// Target centroid recomputed — with three orthogonal unit vectors its
+	// centroid is {1/3, 1/3, 1/3, 0}, which differs from the pre-merge value.
+	postC, _ := s.store.GetCluster(ctx, clusterC)
+	if postC == nil {
+		t.Fatal("target cluster missing after merge")
+	}
+	if postC.ItemCount != 3 {
+		t.Errorf("target ItemCount = %d, want 3", postC.ItemCount)
+	}
+	if vectorsEqual(postC.Centroid, preC.Centroid) {
+		t.Errorf("target centroid unchanged after merge: %v", postC.Centroid)
+	}
+}
+
+func TestHandleMergeClusters_MergesEpisodes(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	emb.vectors["sitA\nactA\noutA\npA"] = []float32{1, 0, 0, 0}
+	emb.vectors["sitB\nactB\noutB\npB"] = []float32{0, 1, 0, 0}
+
+	_, a1, err := s.handleWrite(ctx, nil, WriteInput{Type: "feedback", Episode: &EpisodePayload{
+		Situation: "sitA", Action: "actA", Outcome: "outA", Preemptive: "pA",
+	}})
+	if err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	_, b1, err := s.handleWrite(ctx, nil, WriteInput{Type: "feedback", Episode: &EpisodePayload{
+		Situation: "sitB", Action: "actB", Outcome: "outB", Preemptive: "pB",
+	}})
+	if err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+
+	ea, _ := s.store.GetEpisode(ctx, a1.ID)
+	eb, _ := s.store.GetEpisode(ctx, b1.ID)
+	if ea.ClusterID == eb.ClusterID {
+		t.Fatalf("expected distinct clusters; both in %s", ea.ClusterID)
+	}
+
+	_, out, err := s.handleMergeClusters(ctx, nil, MergeClustersInput{
+		SourceClusterIDs: []string{ea.ClusterID},
+		TargetClusterID:  eb.ClusterID,
+	})
+	if err != nil {
+		t.Fatalf("handleMergeClusters: %v", err)
+	}
+	if out.MergedCount != 1 {
+		t.Errorf("MergedCount = %d, want 1", out.MergedCount)
+	}
+	post, _ := s.store.GetEpisode(ctx, a1.ID)
+	if post.ClusterID != eb.ClusterID {
+		t.Errorf("episode cluster = %q, want %q", post.ClusterID, eb.ClusterID)
+	}
+}
+
+func TestHandleMergeClusters_TargetInSourceList(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, clusterA, _, clusterB := seedTwoClusters(t, s, emb)
+
+	_, _, err := s.handleMergeClusters(context.Background(), nil, MergeClustersInput{
+		SourceClusterIDs: []string{clusterA, clusterB},
+		TargetClusterID:  clusterA,
+	})
+	if err == nil {
+		t.Fatal("expected error when target is in source list")
+	}
+	if !strings.Contains(err.Error(), "cannot be in source list") {
+		t.Errorf("error = %q, want it to contain 'cannot be in source list'", err)
+	}
+}
+
+func TestHandleMergeClusters_SourceNotFound_NoPartialMerge(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	aID, clusterA, bID, clusterB := seedTwoClusters(t, s, emb)
+
+	// Include a bogus source ID alongside a valid one. Pre-validation must
+	// refuse the whole op — no facts should move, no clusters deleted. This
+	// is the atomicity proof against the real memStore: including a
+	// nonexistent ID hits the pre-validation gate before any mutation.
+	_, _, err := s.handleMergeClusters(ctx, nil, MergeClustersInput{
+		SourceClusterIDs: []string{clusterA, "ghost-cluster"},
+		TargetClusterID:  clusterB,
+	})
+	if err == nil {
+		t.Fatal("expected error for missing source cluster")
+	}
+	if !strings.Contains(err.Error(), "cluster not found: ghost-cluster") {
+		t.Errorf("error = %q, want it to contain 'cluster not found: ghost-cluster'", err)
+	}
+
+	// State unchanged: a still in clusterA, b still in clusterB, clusterA still exists.
+	fa, _ := s.store.GetFact(ctx, aID)
+	if fa.ClusterID != clusterA {
+		t.Errorf("a moved despite validation failure: ClusterID = %q, want %q", fa.ClusterID, clusterA)
+	}
+	fb, _ := s.store.GetFact(ctx, bID)
+	if fb.ClusterID != clusterB {
+		t.Errorf("b moved despite validation failure: ClusterID = %q, want %q", fb.ClusterID, clusterB)
+	}
+	cl, _ := s.store.GetCluster(ctx, clusterA)
+	if cl == nil {
+		t.Errorf("clusterA was deleted despite validation failure")
+	}
+}
+
+func TestHandleMergeClusters_TargetNotFound(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, clusterA, _, _ := seedTwoClusters(t, s, emb)
+
+	_, _, err := s.handleMergeClusters(context.Background(), nil, MergeClustersInput{
+		SourceClusterIDs: []string{clusterA},
+		TargetClusterID:  "ghost-target",
+	})
+	if err == nil {
+		t.Fatal("expected error for missing target cluster")
+	}
+	if !strings.Contains(err.Error(), "cluster not found: ghost-target") {
+		t.Errorf("error = %q, want it to contain 'cluster not found: ghost-target'", err)
+	}
+}
+
+func TestHandleMergeClusters_EmptySourceList(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	_, _, _, clusterB := seedTwoClusters(t, s, emb)
+
+	_, _, err := s.handleMergeClusters(context.Background(), nil, MergeClustersInput{
+		SourceClusterIDs: []string{},
+		TargetClusterID:  clusterB,
+	})
+	if err == nil {
+		t.Fatal("expected error for empty source list")
+	}
+	if !strings.Contains(err.Error(), "source_cluster_ids must be non-empty") {
+		t.Errorf("error = %q, want it to contain 'source_cluster_ids must be non-empty'", err)
+	}
+}

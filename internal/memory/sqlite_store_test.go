@@ -1742,3 +1742,157 @@ func TestSQLite_RecomputeCentroid_EmptyCluster(t *testing.T) {
 		t.Fatalf("RecomputeCentroid empty = %v, want ErrEmptyCluster", err)
 	}
 }
+
+// --- Phase 2B: MoveAllClusterMembers ---
+
+func TestSQLiteMoveAllClusterMembers_FactsAndEpisodes(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "src"}); err != nil {
+		t.Fatalf("CreateCluster src: %v", err)
+	}
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "dst"}); err != nil {
+		t.Fatalf("CreateCluster dst: %v", err)
+	}
+
+	// Seed: 2 facts + 1 episode in src, 1 fact in dst (to prove we don't touch it).
+	f1 := testdataFacts()[0]
+	f1.ClusterID = "src"
+	f1ID, err := s.InsertFact(ctx, f1)
+	if err != nil {
+		t.Fatalf("InsertFact f1: %v", err)
+	}
+	f2 := testdataFacts()[1]
+	f2.ClusterID = "src"
+	f2ID, err := s.InsertFact(ctx, f2)
+	if err != nil {
+		t.Fatalf("InsertFact f2: %v", err)
+	}
+	ep := testdataEpisodes()[0]
+	ep.ClusterID = "src"
+	epID, err := s.InsertEpisode(ctx, ep)
+	if err != nil {
+		t.Fatalf("InsertEpisode: %v", err)
+	}
+	f3 := testdataFacts()[2]
+	f3.ClusterID = "dst"
+	f3ID, err := s.InsertFact(ctx, f3)
+	if err != nil {
+		t.Fatalf("InsertFact f3: %v", err)
+	}
+
+	time.Sleep(1100 * time.Millisecond) // RFC3339 1-second granularity
+
+	moved, err := s.MoveAllClusterMembers(ctx, "src", "dst")
+	if err != nil {
+		t.Fatalf("MoveAllClusterMembers: %v", err)
+	}
+	if moved != 3 {
+		t.Errorf("moved = %d, want 3", moved)
+	}
+
+	// Facts moved.
+	got1, _ := s.GetFact(ctx, f1ID)
+	if got1.ClusterID != "dst" {
+		t.Errorf("f1.ClusterID = %q, want dst", got1.ClusterID)
+	}
+	if !got1.AccessedAt.After(f1.AccessedAt) {
+		t.Errorf("f1.AccessedAt not bumped")
+	}
+	got2, _ := s.GetFact(ctx, f2ID)
+	if got2.ClusterID != "dst" {
+		t.Errorf("f2.ClusterID = %q, want dst", got2.ClusterID)
+	}
+	// Episode moved.
+	gotEp, _ := s.GetEpisode(ctx, epID)
+	if gotEp.ClusterID != "dst" {
+		t.Errorf("ep.ClusterID = %q, want dst", gotEp.ClusterID)
+	}
+	// Pre-existing dst fact untouched.
+	got3, _ := s.GetFact(ctx, f3ID)
+	if got3.ClusterID != "dst" {
+		t.Errorf("f3.ClusterID = %q, want dst (unchanged)", got3.ClusterID)
+	}
+
+	// Counts: src empty, dst holds 4.
+	n, err := s.CountFactsByCluster(ctx, "src")
+	if err != nil || n != 0 {
+		t.Errorf("CountFactsByCluster src = %d, %v; want 0, nil", n, err)
+	}
+	n, err = s.CountEpisodesByCluster(ctx, "src")
+	if err != nil || n != 0 {
+		t.Errorf("CountEpisodesByCluster src = %d, %v; want 0, nil", n, err)
+	}
+	nf, _ := s.CountFactsByCluster(ctx, "dst")
+	ne, _ := s.CountEpisodesByCluster(ctx, "dst")
+	if nf+ne != 4 {
+		t.Errorf("dst total = %d, want 4", nf+ne)
+	}
+}
+
+func TestSQLiteMoveAllClusterMembers_EmptySource(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "src"}); err != nil {
+		t.Fatalf("CreateCluster src: %v", err)
+	}
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "dst"}); err != nil {
+		t.Fatalf("CreateCluster dst: %v", err)
+	}
+
+	moved, err := s.MoveAllClusterMembers(ctx, "src", "dst")
+	if err != nil {
+		t.Fatalf("MoveAllClusterMembers: %v", err)
+	}
+	if moved != 0 {
+		t.Errorf("moved = %d, want 0", moved)
+	}
+}
+
+func TestSQLiteMoveAllClusterMembers_IgnoresSuperseded(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "src"}); err != nil {
+		t.Fatalf("CreateCluster src: %v", err)
+	}
+	if err := s.CreateCluster(ctx, ClusterNode{ID: "dst"}); err != nil {
+		t.Fatalf("CreateCluster dst: %v", err)
+	}
+
+	f1 := testdataFacts()[0]
+	f1.ClusterID = "src"
+	f1ID, err := s.InsertFact(ctx, f1)
+	if err != nil {
+		t.Fatalf("InsertFact f1: %v", err)
+	}
+	f2 := testdataFacts()[1]
+	f2.ClusterID = "src"
+	f2ID, err := s.InsertFact(ctx, f2)
+	if err != nil {
+		t.Fatalf("InsertFact f2: %v", err)
+	}
+	// Mark f1 as superseded — it should NOT be moved (non-superseded only).
+	if err := s.SupersedeFact(ctx, f1ID, f2ID); err != nil {
+		t.Fatalf("SupersedeFact: %v", err)
+	}
+
+	moved, err := s.MoveAllClusterMembers(ctx, "src", "dst")
+	if err != nil {
+		t.Fatalf("MoveAllClusterMembers: %v", err)
+	}
+	if moved != 1 {
+		t.Errorf("moved = %d, want 1 (f1 is superseded)", moved)
+	}
+	// f1 still in src; f2 moved.
+	got1, _ := s.GetFact(ctx, f1ID)
+	if got1.ClusterID != "src" {
+		t.Errorf("f1 (superseded) moved: ClusterID = %q, want src", got1.ClusterID)
+	}
+	got2, _ := s.GetFact(ctx, f2ID)
+	if got2.ClusterID != "dst" {
+		t.Errorf("f2.ClusterID = %q, want dst", got2.ClusterID)
+	}
+}

@@ -917,6 +917,75 @@ func (s *sqliteStore) SetMemoryCluster(ctx context.Context, memoryID, clusterID 
 	return fmt.Errorf("memory not found: %s", memoryID)
 }
 
+// withTx begins a transaction, invokes fn, and commits on success or rolls
+// back on error. If fn panics the transaction is rolled back and the panic
+// re-raised. Use this for multi-statement operations that must be atomic.
+func (s *sqliteStore) withTx(ctx context.Context, fn func(*sql.Tx) error) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite store: begin tx: %w", err)
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			return
+		}
+		err = tx.Commit()
+		if err != nil {
+			err = fmt.Errorf("sqlite store: commit tx: %w", err)
+		}
+	}()
+	return fn(tx)
+}
+
+// MoveAllClusterMembers reparents all non-superseded facts and all episodes
+// from sourceClusterID into targetClusterID atomically via a single
+// transaction. Returns the total number of rows moved. accessed_at is bumped
+// on every moved row.
+func (s *sqliteStore) MoveAllClusterMembers(ctx context.Context, sourceClusterID, targetClusterID string) (int, error) {
+	var moved int
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		now := time.Now().UTC().Format(timeFormat)
+
+		factsRes, err := tx.ExecContext(ctx,
+			`UPDATE facts SET cluster_id = ?, accessed_at = ?
+			 WHERE cluster_id = ? AND superseded_by IS NULL`,
+			targetClusterID, now, sourceClusterID,
+		)
+		if err != nil {
+			return fmt.Errorf("sqlite store: move cluster members: facts: %w", err)
+		}
+		factsN, err := factsRes.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("sqlite store: move cluster members: facts rows affected: %w", err)
+		}
+
+		epRes, err := tx.ExecContext(ctx,
+			`UPDATE episodes SET cluster_id = ?, accessed_at = ?
+			 WHERE cluster_id = ?`,
+			targetClusterID, now, sourceClusterID,
+		)
+		if err != nil {
+			return fmt.Errorf("sqlite store: move cluster members: episodes: %w", err)
+		}
+		epN, err := epRes.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("sqlite store: move cluster members: episodes rows affected: %w", err)
+		}
+
+		moved = int(factsN + epN)
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return moved, nil
+}
+
 // DeleteCluster removes the cluster row with the given id. Idempotent: a
 // missing cluster returns nil. Refuses to delete if any non-superseded fact
 // or any episode still references the cluster (safety guard against

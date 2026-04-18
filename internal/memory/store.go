@@ -130,6 +130,15 @@ type Store interface {
 	// references the cluster — the caller must move members first.
 	DeleteCluster(ctx context.Context, id string) error
 
+	// MoveAllClusterMembers reparents every non-superseded fact and every
+	// episode currently assigned to sourceClusterID into targetClusterID in a
+	// single logical operation and returns the total number of rows moved
+	// (facts + episodes). Rows' accessed_at is bumped to now() as part of the
+	// write. Returns 0 with no error if the source cluster has no members.
+	// Implementations should perform this atomically (single transaction for
+	// durable stores) so partial moves cannot be observed.
+	MoveAllClusterMembers(ctx context.Context, sourceClusterID, targetClusterID string) (moved int, err error)
+
 	// TickAllClusters increments turns_since by 1 for all clusters, then sets
 	// turns_since=0 for the clusters named in accessedIDs. last_access is
 	// updated to time.Now().UTC() for the accessed ones. Single transaction.

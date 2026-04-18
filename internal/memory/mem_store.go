@@ -733,6 +733,43 @@ func (m *memStore) SetMemoryCluster(_ context.Context, memoryID, clusterID strin
 	return fmt.Errorf("memory not found: %s", memoryID)
 }
 
+// MoveAllClusterMembers reparents every non-superseded fact and every episode
+// whose cluster_id equals sourceClusterID onto targetClusterID. The move is
+// guarded by the store's write mutex, so observers outside the lock see
+// either the pre-state or the post-state — never a half-move.
+func (m *memStore) MoveAllClusterMembers(_ context.Context, sourceClusterID, targetClusterID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now().UTC()
+	moved := 0
+
+	for id, f := range m.facts {
+		if f.ClusterID != sourceClusterID {
+			continue
+		}
+		if f.SupersededBy != nil {
+			continue
+		}
+		f.ClusterID = targetClusterID
+		f.AccessedAt = now
+		m.facts[id] = f
+		moved++
+	}
+
+	for id, ep := range m.episodes {
+		if ep.ClusterID != sourceClusterID {
+			continue
+		}
+		ep.ClusterID = targetClusterID
+		ep.AccessedAt = now
+		m.episodes[id] = ep
+		moved++
+	}
+
+	return moved, nil
+}
+
 // DeleteCluster is idempotent — a missing cluster returns nil. Refuses if any
 // non-superseded fact or any episode still references the cluster.
 func (m *memStore) DeleteCluster(_ context.Context, id string) error {

@@ -1186,6 +1186,133 @@ func (s *Server) collectClusterMembership(ctx context.Context, clusterID string)
 	return members, nil
 }
 
+// --- memory_merge_clusters ---
+
+// MergeClustersInput is the input schema for the memory_merge_clusters tool.
+type MergeClustersInput struct {
+	SourceClusterIDs []string `json:"source_cluster_ids" jsonschema:"clusters to merge and delete (must be non-empty)"`
+	TargetClusterID  string   `json:"target_cluster_id" jsonschema:"destination cluster (must exist, cannot be in source list)"`
+}
+
+// MergeClustersOutput is the output schema for the memory_merge_clusters tool.
+type MergeClustersOutput struct {
+	TargetClusterID string   `json:"target_cluster_id"`
+	MergedCount     int      `json:"merged_count"`
+	DeletedClusters []string `json:"deleted_clusters"`
+	NewItemCount    int      `json:"new_item_count"`
+}
+
+func (s *Server) handleMergeClusters(ctx context.Context, _ *mcpsdk.CallToolRequest, in MergeClustersInput) (*mcpsdk.CallToolResult, MergeClustersOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, MergeClustersOutput{}, nil
+	}
+
+	if len(in.SourceClusterIDs) == 0 {
+		return nil, MergeClustersOutput{}, fmt.Errorf("source_cluster_ids must be non-empty")
+	}
+	if in.TargetClusterID == "" {
+		return nil, MergeClustersOutput{}, fmt.Errorf("target_cluster_id is required")
+	}
+
+	// Validate up-front (pre-mutation): target not in sources, and all IDs
+	// exist. This is the atomicity guarantee for the real store: if validation
+	// passes, every subsequent op is a bulk UPDATE/DELETE that either fully
+	// succeeds or is rolled back inside the store's transaction.
+	for _, src := range in.SourceClusterIDs {
+		if src == in.TargetClusterID {
+			return nil, MergeClustersOutput{}, fmt.Errorf("target cluster %s cannot be in source list", in.TargetClusterID)
+		}
+	}
+
+	target, err := s.store.GetCluster(ctx, in.TargetClusterID)
+	if err != nil {
+		return nil, MergeClustersOutput{}, fmt.Errorf("get target cluster: %w", err)
+	}
+	if target == nil {
+		return nil, MergeClustersOutput{}, fmt.Errorf("cluster not found: %s", in.TargetClusterID)
+	}
+	// Dedup sources while preserving order — repeated IDs would cause the
+	// second delete to be a no-op and inflate nothing, but an explicit check
+	// keeps the reported DeletedClusters list accurate.
+	seen := make(map[string]struct{}, len(in.SourceClusterIDs))
+	sources := make([]string, 0, len(in.SourceClusterIDs))
+	for _, src := range in.SourceClusterIDs {
+		if src == "" {
+			return nil, MergeClustersOutput{}, fmt.Errorf("source cluster id cannot be empty")
+		}
+		if _, dup := seen[src]; dup {
+			continue
+		}
+		seen[src] = struct{}{}
+
+		cl, err := s.store.GetCluster(ctx, src)
+		if err != nil {
+			return nil, MergeClustersOutput{}, fmt.Errorf("get source cluster %s: %w", src, err)
+		}
+		if cl == nil {
+			return nil, MergeClustersOutput{}, fmt.Errorf("cluster not found: %s", src)
+		}
+		sources = append(sources, src)
+	}
+
+	// Perform moves and deletes. Each MoveAllClusterMembers is atomic inside
+	// the store (sqlite wraps both UPDATEs in a transaction). With the
+	// pre-validation above, no source can disappear between validation and
+	// move, so the loop cannot observe a partial-failure state.
+	totalMoved := 0
+	deleted := make([]string, 0, len(sources))
+	for _, src := range sources {
+		moved, err := s.store.MoveAllClusterMembers(ctx, src, in.TargetClusterID)
+		if err != nil {
+			return nil, MergeClustersOutput{}, fmt.Errorf("move members from %s: %w", src, err)
+		}
+		totalMoved += moved
+
+		if err := s.store.DeleteCluster(ctx, src); err != nil {
+			return nil, MergeClustersOutput{}, fmt.Errorf("delete source cluster %s: %w", src, err)
+		}
+		deleted = append(deleted, src)
+	}
+
+	// Recompute target centroid AFTER moves land. Centroid drift on an error
+	// here is recoverable — membership is correct and a subsequent
+	// recompute/tick will heal it.
+	if err := memory.RecomputeCentroid(ctx, s.store, in.TargetClusterID); err != nil && err != memory.ErrEmptyCluster {
+		return nil, MergeClustersOutput{}, fmt.Errorf("recompute target centroid: %w", err)
+	}
+
+	// Reset turns_since on the target — merge is an access, same as reassign.
+	if err := s.mgr.TickDecay(ctx, []string{in.TargetClusterID}); err != nil {
+		s.logger.Warn("memory_merge_clusters: tick decay failed", "cluster_id", in.TargetClusterID, "err", err)
+	}
+
+	// Report the post-merge item count.
+	newItemCount := 0
+	postTarget, err := s.store.GetCluster(ctx, in.TargetClusterID)
+	if err != nil {
+		return nil, MergeClustersOutput{}, fmt.Errorf("get target cluster (post): %w", err)
+	}
+	if postTarget != nil {
+		newItemCount = postTarget.ItemCount
+	}
+
+	s.logger.Info("memory_merge_clusters",
+		"target_cluster_id", in.TargetClusterID,
+		"merged_count", totalMoved,
+		"deleted_clusters", deleted,
+		"new_item_count", newItemCount,
+	)
+
+	return nil, MergeClustersOutput{
+		TargetClusterID: in.TargetClusterID,
+		MergedCount:     totalMoved,
+		DeletedClusters: deleted,
+		NewItemCount:    newItemCount,
+	}, nil
+}
+
 // --- memory_get ---
 
 // GetInput is the input schema for the memory_get tool.
