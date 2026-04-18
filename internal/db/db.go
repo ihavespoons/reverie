@@ -1,6 +1,6 @@
 // Package db provides SQLite database initialization for reverie.
-// It uses the pure-Go modernc.org/sqlite driver (no CGO) and embeds the
-// schema DDL for automatic table creation on startup.
+// It uses the pure-Go modernc.org/sqlite driver (no CGO) and embeds versioned
+// migrations that are applied automatically on startup.
 package db
 
 import (
@@ -11,12 +11,16 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// schemaSQL is the canonical initial schema snapshot. It is embedded as
+// migration 1 (`initial_schema`) in the migrations slice. Future schema
+// changes go in new migrations; this file is not edited after release.
+//
 //go:embed schema.sql
 var schemaSQL string
 
 // Open opens (or creates) a SQLite database at the given path, configures
-// WAL mode, foreign keys, and busy timeout, then applies the embedded schema.
-// The caller is responsible for closing the returned *sql.DB.
+// WAL mode, foreign keys, and busy timeout, then applies any pending schema
+// migrations. The caller is responsible for closing the returned *sql.DB.
 func Open(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -36,10 +40,11 @@ func Open(path string) (*sql.DB, error) {
 		}
 	}
 
-	// Apply the full schema. CREATE TABLE IF NOT EXISTS makes this idempotent.
-	if _, err := db.Exec(schemaSQL); err != nil {
+	// Apply pending schema migrations (creates schema_migrations bookkeeping
+	// table on first run; no-op when the DB is fully migrated).
+	if err := applyMigrations(db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("exec schema: %w", err)
+		return nil, fmt.Errorf("apply migrations: %w", err)
 	}
 
 	return db, nil
