@@ -395,6 +395,161 @@ func TestHandleList_SubtypeFilter(t *testing.T) {
 	}
 }
 
+// TestHandleList_IncludesClusterID verifies every list entry (fact and episode)
+// comes back with a populated cluster_id — Phase 1A requirement.
+func TestHandleList_IncludesClusterID(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["fact content"] = []float32{0.4, 0.4, 0.0, 0.0}
+	episodeText := "sit\nact\nout\npre"
+	emb.vectors[episodeText] = []float32{0.0, 0.0, 0.4, 0.4}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, _, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact content", Type: "project"})
+	if err != nil {
+		t.Fatalf("write fact: %v", err)
+	}
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Episode: &EpisodePayload{
+			Situation:  "sit",
+			Action:     "act",
+			Outcome:    "out",
+			Preemptive: "pre",
+		},
+	})
+	if err != nil {
+		t.Fatalf("write episode: %v", err)
+	}
+
+	// L2 list: cluster_id populated.
+	_, l2Out, err := s.handleList(ctx, nil, ListInput{})
+	if err != nil {
+		t.Fatalf("list l2: %v", err)
+	}
+	if len(l2Out.Memories) != 1 {
+		t.Fatalf("expected 1 l2 memory, got %d", len(l2Out.Memories))
+	}
+	for _, m := range l2Out.Memories {
+		if m.ClusterID == "" {
+			t.Errorf("l2 memory %s has empty cluster_id", m.ID)
+		}
+	}
+
+	// L3 list: cluster_id populated.
+	_, l3Out, err := s.handleList(ctx, nil, ListInput{Layer: "l3"})
+	if err != nil {
+		t.Fatalf("list l3: %v", err)
+	}
+	if len(l3Out.Memories) != 1 {
+		t.Fatalf("expected 1 l3 memory, got %d", len(l3Out.Memories))
+	}
+	for _, m := range l3Out.Memories {
+		if m.ClusterID == "" {
+			t.Errorf("l3 memory %s has empty cluster_id", m.ID)
+		}
+	}
+}
+
+// TestHandleList_TagsAlwaysNonNil verifies the tags field is a non-nil slice
+// for every entry — empty slice for untagged memories, not a nil slice.
+func TestHandleList_TagsAlwaysNonNil(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["tagged fact"] = []float32{0.1, 0.0, 0.0, 0.0}
+	emb.vectors["untagged fact"] = []float32{0.0, 0.1, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, _, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "tagged fact",
+		Type:    "project",
+		Tags:    []string{"alpha"},
+	})
+	if err != nil {
+		t.Fatalf("write tagged: %v", err)
+	}
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{
+		Content: "untagged fact",
+		Type:    "project",
+	})
+	if err != nil {
+		t.Fatalf("write untagged: %v", err)
+	}
+
+	_, out, err := s.handleList(ctx, nil, ListInput{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(out.Memories) != 2 {
+		t.Fatalf("expected 2 memories, got %d", len(out.Memories))
+	}
+	for _, m := range out.Memories {
+		if m.Tags == nil {
+			t.Errorf("memory %s has nil Tags; expected empty slice for untagged or populated for tagged", m.ID)
+		}
+		if m.Content == "untagged fact" && len(m.Tags) != 0 {
+			t.Errorf("untagged fact has Tags=%v, want empty slice", m.Tags)
+		}
+		if m.Content == "tagged fact" {
+			if len(m.Tags) != 1 || m.Tags[0] != "alpha" {
+				t.Errorf("tagged fact has Tags=%v, want [alpha]", m.Tags)
+			}
+		}
+	}
+}
+
+// TestHandleList_TagsAnyFilter verifies the tags_any input filter plumbs
+// through ListFilter.TagsAny and returns only matching memories.
+func TestHandleList_TagsAnyFilter(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["foo fact"] = []float32{0.1, 0.0, 0.0, 0.0}
+	emb.vectors["bar fact"] = []float32{0.0, 0.1, 0.0, 0.0}
+	emb.vectors["other fact"] = []float32{0.0, 0.0, 0.1, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, _, err := s.handleWrite(ctx, nil, WriteInput{
+		Content: "foo fact",
+		Type:    "project",
+		Tags:    []string{"foo"},
+	})
+	if err != nil {
+		t.Fatalf("write foo: %v", err)
+	}
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{
+		Content: "bar fact",
+		Type:    "project",
+		Tags:    []string{"bar"},
+	})
+	if err != nil {
+		t.Fatalf("write bar: %v", err)
+	}
+	_, _, err = s.handleWrite(ctx, nil, WriteInput{
+		Content: "other fact",
+		Type:    "project",
+	})
+	if err != nil {
+		t.Fatalf("write other: %v", err)
+	}
+
+	_, out, err := s.handleList(ctx, nil, ListInput{TagsAny: []string{"foo"}})
+	if err != nil {
+		t.Fatalf("list tags_any=[foo]: %v", err)
+	}
+	if len(out.Memories) != 1 {
+		t.Fatalf("expected 1 memory with tag foo, got %d", len(out.Memories))
+	}
+	if out.Memories[0].Content != "foo fact" {
+		t.Errorf("content = %q, want 'foo fact'", out.Memories[0].Content)
+	}
+	if len(out.Memories[0].Tags) != 1 || out.Memories[0].Tags[0] != "foo" {
+		t.Errorf("Tags = %v, want [foo]", out.Memories[0].Tags)
+	}
+}
+
 func TestHandleList_EmptyStore(t *testing.T) {
 	emb := newStubEmbedder(4)
 	s := newTestServer(emb)

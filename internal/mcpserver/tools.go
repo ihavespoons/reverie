@@ -493,24 +493,27 @@ func (s *Server) handleForget(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 
 // ListInput is the input schema for the memory_list tool.
 type ListInput struct {
-	Layer   string `json:"layer,omitempty" jsonschema:"l2 (default, facts) or l3 (episodes)"`
-	Subtype string `json:"subtype,omitempty" jsonschema:"Filter by subtype: user, feedback, project, reference"`
-	Limit   int    `json:"limit,omitempty" jsonschema:"Maximum number of results (default 25)"`
-	Offset  int    `json:"offset,omitempty" jsonschema:"Number of results to skip (for pagination)"`
-	Sort    string `json:"sort,omitempty" jsonschema:"Sort order: created (default) or accessed"`
+	Layer   string   `json:"layer,omitempty" jsonschema:"l2 (default, facts) or l3 (episodes)"`
+	Subtype string   `json:"subtype,omitempty" jsonschema:"Filter by subtype: user, feedback, project, reference"`
+	Limit   int      `json:"limit,omitempty" jsonschema:"Maximum number of results (default 25)"`
+	Offset  int      `json:"offset,omitempty" jsonschema:"Number of results to skip (for pagination)"`
+	Sort    string   `json:"sort,omitempty" jsonschema:"Sort order: created (default) or accessed"`
+	TagsAny []string `json:"tags_any,omitempty" jsonschema:"Filter to memories with at least one of these tags"`
 }
 
 // ListMemory is a memory entry in the list result, without the embedding vector
 // to avoid bloating the tool response.
 type ListMemory struct {
-	ID         string  `json:"id"`
-	Content    string  `json:"content"`
-	Layer      string  `json:"layer"`
-	Subtype    string  `json:"subtype,omitempty"`
-	Source     string  `json:"source,omitempty"`
-	Confidence float64 `json:"confidence,omitempty"`
-	CreatedAt  string  `json:"created_at"`
-	AccessedAt string  `json:"accessed_at"`
+	ID         string   `json:"id"`
+	Content    string   `json:"content"`
+	Layer      string   `json:"layer"`
+	Subtype    string   `json:"subtype,omitempty"`
+	Source     string   `json:"source,omitempty"`
+	Confidence float64  `json:"confidence,omitempty"`
+	CreatedAt  string   `json:"created_at"`
+	AccessedAt string   `json:"accessed_at"`
+	ClusterID  string   `json:"cluster_id"`
+	Tags       []string `json:"tags,omitempty"`
 }
 
 // ListOutput is the output schema for the memory_list tool.
@@ -526,9 +529,10 @@ func (s *Server) handleList(ctx context.Context, _ *mcpsdk.CallToolRequest, in L
 	}
 
 	filter := memory.ListFilter{
-		Limit:  in.Limit,
-		Offset: in.Offset,
-		Sort:   in.Sort,
+		Limit:   in.Limit,
+		Offset:  in.Offset,
+		Sort:    in.Sort,
+		TagsAny: in.TagsAny,
 	}
 
 	if in.Layer == "l3" {
@@ -549,6 +553,8 @@ func (s *Server) handleList(ctx context.Context, _ *mcpsdk.CallToolRequest, in L
 				Layer:      string(memory.TypeL3Episodic),
 				CreatedAt:  ep.CreatedAt.Format("2006-01-02T15:04:05Z"),
 				AccessedAt: ep.AccessedAt.Format("2006-01-02T15:04:05Z"),
+				ClusterID:  ep.ClusterID,
+				Tags:       normalizeTagsSlice(ep.Tags),
 			}
 		}
 
@@ -579,11 +585,23 @@ func (s *Server) handleList(ctx context.Context, _ *mcpsdk.CallToolRequest, in L
 			Confidence: f.Confidence,
 			CreatedAt:  f.CreatedAt.Format("2006-01-02T15:04:05Z"),
 			AccessedAt: f.AccessedAt.Format("2006-01-02T15:04:05Z"),
+			ClusterID:  f.ClusterID,
+			Tags:       normalizeTagsSlice(f.Tags),
 		}
 	}
 
 	s.logger.Info("memory_list", "count", len(out.Memories), "subtype", in.Subtype)
 	return nil, out, nil
+}
+
+// normalizeTagsSlice returns a non-nil []string so that JSON encoding produces
+// [] instead of null. Per the Phase 1 behavior spec, tool outputs should emit
+// an explicit empty array for the tags field rather than a null.
+func normalizeTagsSlice(tags []string) []string {
+	if tags == nil {
+		return []string{}
+	}
+	return tags
 }
 
 // --- memory_apply_judgment ---
