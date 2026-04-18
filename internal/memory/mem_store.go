@@ -202,10 +202,7 @@ func (m *memStore) ListFacts(_ context.Context, filter ListFilter) ([]Fact, erro
 		limit = 1000
 	}
 
-	offset := filter.Offset
-	if offset > len(results) {
-		offset = len(results)
-	}
+	offset := min(filter.Offset, len(results))
 	results = results[offset:]
 	if len(results) > limit {
 		results = results[:limit]
@@ -493,10 +490,7 @@ func (m *memStore) ListEpisodes(_ context.Context, filter ListFilter) ([]Episode
 		limit = 1000
 	}
 
-	offset := filter.Offset
-	if offset > len(results) {
-		offset = len(results)
-	}
+	offset := min(filter.Offset, len(results))
 	results = results[offset:]
 	if len(results) > limit {
 		results = results[:limit]

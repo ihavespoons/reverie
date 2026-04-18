@@ -977,11 +977,6 @@ func scanEpisodeFrom(sc scanner) (*Episode, error) {
 	return &ep, nil
 }
 
-// scanEpisode scans a single episode from a *sql.Row.
-func scanEpisode(row *sql.Row) (*Episode, error) {
-	return scanEpisodeFrom(row)
-}
-
 // scanEpisodeRows scans a single episode from *sql.Rows.
 func scanEpisodeRows(rows *sql.Rows) (*Episode, error) {
 	return scanEpisodeFrom(rows)
