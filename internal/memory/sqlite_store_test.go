@@ -2139,3 +2139,88 @@ func TestSQLiteReplaceEpisodeLinks(t *testing.T) {
 		t.Errorf("links after nil replace = %v, want empty", got.LinkedFactIDs)
 	}
 }
+
+// --- Phase 4B: ClearFactSuperseded ---
+
+func TestSQLiteClearFactSuperseded_HappyPath(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	facts := testdataFacts()
+	id1, err := s.InsertFact(ctx, facts[0])
+	if err != nil {
+		t.Fatalf("InsertFact[0]: %v", err)
+	}
+	id2, err := s.InsertFact(ctx, facts[1])
+	if err != nil {
+		t.Fatalf("InsertFact[1]: %v", err)
+	}
+	if err := s.SupersedeFact(ctx, id1, id2); err != nil {
+		t.Fatalf("SupersedeFact: %v", err)
+	}
+
+	prev, err := s.ClearFactSuperseded(ctx, id1)
+	if err != nil {
+		t.Fatalf("ClearFactSuperseded: %v", err)
+	}
+	if prev != id2 {
+		t.Errorf("previouslySupersededBy = %q, want %q", prev, id2)
+	}
+
+	f, err := s.GetFact(ctx, id1)
+	if err != nil {
+		t.Fatalf("GetFact: %v", err)
+	}
+	if f == nil {
+		t.Fatal("GetFact returned nil after unsupersede")
+	}
+	if f.SupersededBy != nil {
+		t.Errorf("SupersededBy = %v, want nil", f.SupersededBy)
+	}
+
+	listed, err := s.ListFacts(ctx, ListFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("ListFacts: %v", err)
+	}
+	var found bool
+	for _, r := range listed {
+		if r.ID == id1 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("ListFacts did not include revived fact")
+	}
+}
+
+func TestSQLiteClearFactSuperseded_NotSuperseded(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	id, err := s.InsertFact(ctx, testdataFacts()[0])
+	if err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+
+	_, err = s.ClearFactSuperseded(ctx, id)
+	if err == nil {
+		t.Fatal("expected error on active fact")
+	}
+	if !strings.Contains(err.Error(), "not superseded") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "not superseded")
+	}
+}
+
+func TestSQLiteClearFactSuperseded_NonexistentID(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	_, err := s.ClearFactSuperseded(ctx, "does-not-exist")
+	if err == nil {
+		t.Fatal("expected error on nonexistent id")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "not found")
+	}
+}

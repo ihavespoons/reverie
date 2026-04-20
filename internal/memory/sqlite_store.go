@@ -1205,6 +1205,42 @@ func (s *sqliteStore) SupersedeFact(ctx context.Context, oldID, newID string) er
 	return nil
 }
 
+// ClearFactSuperseded sets the superseded_by column back to NULL on the given
+// fact, bumps accessed_at, and returns the previous superseded_by value.
+//
+// Errors:
+//   - "fact not found: <id>" if no row exists for id.
+//   - "fact is not superseded" if the row exists but superseded_by is NULL.
+//
+// Implementation note: this is a read-then-update without an explicit
+// transaction. Contention on reversing a supersede is effectively zero
+// (it's an operator-driven correction, not an automatic path), so the
+// extra overhead of a tx is not warranted.
+func (s *sqliteStore) ClearFactSuperseded(ctx context.Context, id string) (string, error) {
+	var supersededBy sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT superseded_by FROM facts WHERE id = ?`, id,
+	).Scan(&supersededBy)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("fact not found: %s", id)
+	}
+	if err != nil {
+		return "", fmt.Errorf("sqlite store: clear fact superseded: %w", err)
+	}
+	if !supersededBy.Valid || supersededBy.String == "" {
+		return "", fmt.Errorf("fact is not superseded")
+	}
+
+	now := time.Now().UTC().Format(timeFormat)
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE facts SET superseded_by = NULL, accessed_at = ? WHERE id = ?`,
+		now, id,
+	); err != nil {
+		return "", fmt.Errorf("sqlite store: clear fact superseded: %w", err)
+	}
+	return supersededBy.String, nil
+}
+
 func (s *sqliteStore) GetFactSupersedes(ctx context.Context, id string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id FROM facts WHERE superseded_by = ?`, id,

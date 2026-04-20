@@ -4759,3 +4759,215 @@ func TestHandleWrite_DryRun_InvalidInput(t *testing.T) {
 		t.Error("expected error on dry-run with confidence on episode")
 	}
 }
+
+// --- Phase 4B: memory_unsupersede ---
+
+// TestHandleUnsupersede_HappyPath covers the canonical path:
+// SupersedeFact(old, new) followed by memory_unsupersede(old). Because the
+// superseder is still active we expect the warning to be populated and to
+// mention both IDs (old first, then superseder) per spec.
+func TestHandleUnsupersede_HappyPath(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["first"] = []float32{1, 0, 0, 0}
+	emb.vectors["second"] = []float32{0, 1, 0, 0}
+	srv := newTestServer(emb)
+	defer srv.recallCache.stop()
+
+	ctx := context.Background()
+
+	_, out1, err := srv.handleWrite(ctx, nil, WriteInput{Content: "first", Type: "project"})
+	if err != nil {
+		t.Fatalf("write 1: %v", err)
+	}
+	_, out2, err := srv.handleWrite(ctx, nil, WriteInput{Content: "second", Type: "project"})
+	if err != nil {
+		t.Fatalf("write 2: %v", err)
+	}
+
+	if err := srv.store.SupersedeFact(ctx, out1.ID, out2.ID); err != nil {
+		t.Fatalf("SupersedeFact: %v", err)
+	}
+
+	_, uOut, err := srv.handleUnsupersede(ctx, nil, UnsupersedeInput{FactID: out1.ID})
+	if err != nil {
+		t.Fatalf("handleUnsupersede: %v", err)
+	}
+	if uOut.FactID != out1.ID {
+		t.Errorf("FactID = %q, want %q", uOut.FactID, out1.ID)
+	}
+	if uOut.PreviouslySupersededBy != out2.ID {
+		t.Errorf("PreviouslySupersededBy = %q, want %q", uOut.PreviouslySupersededBy, out2.ID)
+	}
+	if uOut.Warning == "" {
+		t.Fatal("expected Warning to be populated (superseder is still active)")
+	}
+	if !strings.Contains(uOut.Warning, out1.ID) || !strings.Contains(uOut.Warning, out2.ID) {
+		t.Errorf("Warning = %q, should mention both IDs %q and %q", uOut.Warning, out1.ID, out2.ID)
+	}
+
+	// Verify via memory_get that superseded_by is now nil.
+	_, getOut, err := srv.handleGet(ctx, nil, GetInput{ID: out1.ID})
+	if err != nil {
+		t.Fatalf("handleGet: %v", err)
+	}
+	if getOut.SupersededBy != nil {
+		t.Errorf("memory_get SupersededBy = %v, want nil", getOut.SupersededBy)
+	}
+}
+
+// TestHandleUnsupersede_ActiveFact ensures calling unsupersede on a fact with
+// no superseded_by set returns an error (not a silent no-op).
+func TestHandleUnsupersede_ActiveFact(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["a"] = []float32{1, 0, 0, 0}
+	srv := newTestServer(emb)
+	defer srv.recallCache.stop()
+
+	ctx := context.Background()
+	_, out, err := srv.handleWrite(ctx, nil, WriteInput{Content: "a", Type: "project"})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, _, err = srv.handleUnsupersede(ctx, nil, UnsupersedeInput{FactID: out.ID})
+	if err == nil {
+		t.Fatal("expected error on non-superseded fact")
+	}
+	if !strings.Contains(err.Error(), "not superseded") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "not superseded")
+	}
+}
+
+// TestHandleUnsupersede_NonexistentID ensures unknown IDs are rejected.
+func TestHandleUnsupersede_NonexistentID(t *testing.T) {
+	emb := newStubEmbedder(4)
+	srv := newTestServer(emb)
+	defer srv.recallCache.stop()
+
+	ctx := context.Background()
+	_, _, err := srv.handleUnsupersede(ctx, nil, UnsupersedeInput{FactID: "nonexistent-id"})
+	if err == nil {
+		t.Fatal("expected error on nonexistent id")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error = %q, want to contain %q", err.Error(), "not found")
+	}
+}
+
+// TestHandleUnsupersede_NoWarningWhenSupersederAlsoSuperseded builds the
+// chain A->B, B->C (A.superseded_by=B, B.superseded_by=C). Unsupersede A
+// should return the previous value B, but produce no warning because B is
+// no longer active.
+//
+// SupersedeFact signature is (oldID, newID) where oldID.superseded_by = newID.
+// Verified by reading mem_store.go SupersedeFact.
+func TestHandleUnsupersede_NoWarningWhenSupersederAlsoSuperseded(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["alpha"] = []float32{1, 0, 0, 0}
+	emb.vectors["beta"] = []float32{0, 1, 0, 0}
+	emb.vectors["gamma"] = []float32{0, 0, 1, 0}
+	srv := newTestServer(emb)
+	defer srv.recallCache.stop()
+
+	ctx := context.Background()
+
+	_, aOut, err := srv.handleWrite(ctx, nil, WriteInput{Content: "alpha", Type: "project"})
+	if err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	_, bOut, err := srv.handleWrite(ctx, nil, WriteInput{Content: "beta", Type: "project"})
+	if err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	_, cOut, err := srv.handleWrite(ctx, nil, WriteInput{Content: "gamma", Type: "project"})
+	if err != nil {
+		t.Fatalf("write c: %v", err)
+	}
+
+	// A is superseded BY B.
+	if err := srv.store.SupersedeFact(ctx, aOut.ID, bOut.ID); err != nil {
+		t.Fatalf("SupersedeFact(a,b): %v", err)
+	}
+	// B is superseded BY C — now B is no longer active.
+	if err := srv.store.SupersedeFact(ctx, bOut.ID, cOut.ID); err != nil {
+		t.Fatalf("SupersedeFact(b,c): %v", err)
+	}
+
+	_, uOut, err := srv.handleUnsupersede(ctx, nil, UnsupersedeInput{FactID: aOut.ID})
+	if err != nil {
+		t.Fatalf("handleUnsupersede: %v", err)
+	}
+	if uOut.PreviouslySupersededBy != bOut.ID {
+		t.Errorf("PreviouslySupersededBy = %q, want %q", uOut.PreviouslySupersededBy, bOut.ID)
+	}
+	if uOut.Warning != "" {
+		t.Errorf("expected empty Warning when superseder is itself superseded, got %q", uOut.Warning)
+	}
+}
+
+// TestHandleUnsupersede_ListFactsReflectsRevival seeds two near-duplicate
+// facts to trigger auto-supersede via handleWrite, then unsupersedes the old
+// one. Afterwards ListFacts (which filters superseded_by IS NOT NULL) should
+// return BOTH facts, confirming the flag flip propagates to the list view.
+func TestHandleUnsupersede_ListFactsReflectsRevival(t *testing.T) {
+	emb := newStubEmbedder(4)
+	// Two near-identical vectors (will trigger auto-supersede via the 0.92
+	// default ConflictThreshold).
+	emb.vectors["Go version is 1.21"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["Go version is 1.22"] = []float32{0.5, 0.5, 0.0, 0.0}
+	srv := newTestServer(emb)
+	defer srv.recallCache.stop()
+
+	ctx := context.Background()
+
+	_, out1, err := srv.handleWrite(ctx, nil, WriteInput{Content: "Go version is 1.21", Type: "project"})
+	if err != nil {
+		t.Fatalf("write 1: %v", err)
+	}
+	_, out2, err := srv.handleWrite(ctx, nil, WriteInput{Content: "Go version is 1.22", Type: "project"})
+	if err != nil {
+		t.Fatalf("write 2: %v", err)
+	}
+
+	// Before: ListFacts excludes the superseded one.
+	before, err := srv.store.ListFacts(ctx, memory.ListFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("ListFacts before: %v", err)
+	}
+	var sawOldBefore bool
+	for _, f := range before {
+		if f.ID == out1.ID {
+			sawOldBefore = true
+		}
+	}
+	if sawOldBefore {
+		t.Fatal("pre: ListFacts should not include auto-superseded fact")
+	}
+
+	// Unsupersede.
+	_, _, err = srv.handleUnsupersede(ctx, nil, UnsupersedeInput{FactID: out1.ID})
+	if err != nil {
+		t.Fatalf("handleUnsupersede: %v", err)
+	}
+
+	// After: both facts should appear.
+	after, err := srv.store.ListFacts(ctx, memory.ListFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("ListFacts after: %v", err)
+	}
+	var sawOld, sawNew bool
+	for _, f := range after {
+		if f.ID == out1.ID {
+			sawOld = true
+		}
+		if f.ID == out2.ID {
+			sawNew = true
+		}
+	}
+	if !sawOld {
+		t.Error("post: ListFacts did not include revived fact")
+	}
+	if !sawNew {
+		t.Error("post: ListFacts did not include superseder fact")
+	}
+}

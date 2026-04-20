@@ -920,6 +920,27 @@ func (m *memStore) SupersedeFact(_ context.Context, oldID, newID string) error {
 	return nil
 }
 
+// ClearFactSuperseded reverses a supersede by clearing the SupersededBy
+// pointer. Returns the previous value, or an error describing whether the
+// fact was missing or simply not superseded.
+func (m *memStore) ClearFactSuperseded(_ context.Context, id string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	f, ok := m.facts[id]
+	if !ok {
+		return "", fmt.Errorf("fact not found: %s", id)
+	}
+	if f.SupersededBy == nil || *f.SupersededBy == "" {
+		return "", fmt.Errorf("fact is not superseded")
+	}
+	prev := *f.SupersededBy
+	f.SupersededBy = nil
+	f.AccessedAt = time.Now().UTC()
+	m.facts[id] = f
+	return prev, nil
+}
+
 func (m *memStore) GetFactSupersedes(_ context.Context, id string) ([]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

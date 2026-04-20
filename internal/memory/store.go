@@ -193,6 +193,17 @@ type Store interface {
 	// new fact. Returns an error if the old fact does not exist.
 	SupersedeFact(ctx context.Context, oldID, newID string) error
 
+	// ClearFactSuperseded reverses a supersede by clearing the superseded_by
+	// column on the given fact. Returns the previous superseded_by value on
+	// success. accessed_at is bumped to time.Now().UTC() as part of the write.
+	//
+	// Error cases, distinguished by error message so handlers can react:
+	//   - "fact not found: <id>" when no row exists for the given id.
+	//   - "fact is not superseded" when the row exists but superseded_by is
+	//     already NULL. The caller should treat this as operator confusion
+	//     rather than a generic not-found.
+	ClearFactSuperseded(ctx context.Context, id string) (previouslySupersededBy string, err error)
+
 	// GetFactSupersedes returns the IDs of facts whose superseded_by equals the
 	// given id. In other words: the history of facts that this fact replaced.
 	// Returns an empty slice (not nil) when the fact supersedes nothing.

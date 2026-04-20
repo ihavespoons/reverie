@@ -232,4 +232,17 @@ func (s *Server) registerTools(srv *mcpsdk.Server) {
 			Title:         "Decay tick",
 		},
 	}, s.handleDecayTick)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_unsupersede",
+		Description: "Reverse an auto-supersede by clearing the superseded_by pointer on a fact so it is active again. " +
+			"Use this when a near-duplicate write was actually a distinct fact and should not have been hidden. " +
+			"Errors if the fact does not exist or is not currently superseded. " +
+			"Returns a warning when the superseder is still active — the operator then has two coexisting facts and may want to memory_forget or memory_update_content one of them.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:  readOnlyFalse,
+			OpenWorldHint: &openWorld,
+			Title:         "Unsupersede fact",
+		},
+	}, s.handleUnsupersede)
 }

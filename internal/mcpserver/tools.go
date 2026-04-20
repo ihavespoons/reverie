@@ -1938,3 +1938,78 @@ func (s *Server) populateClusterSummary(ctx context.Context, clusterID string, o
 		out.ClusterSummary = cl.Summary
 	}
 }
+
+// --- memory_unsupersede ---
+
+// UnsupersedeInput is the input schema for the memory_unsupersede tool.
+type UnsupersedeInput struct {
+	FactID string `json:"fact_id" jsonschema:"ID of the superseded fact to revive"`
+}
+
+// UnsupersedeOutput is the output schema for the memory_unsupersede tool.
+type UnsupersedeOutput struct {
+	FactID                 string `json:"fact_id"`
+	PreviouslySupersededBy string `json:"previously_superseded_by"`
+	// Warning is populated when the formerly-superseding fact is still
+	// active (its superseded_by is nil); the operator has two coexisting
+	// facts and should decide how to reconcile them.
+	Warning string `json:"warning,omitempty"`
+}
+
+// handleUnsupersede clears the superseded_by pointer on a fact, reviving it so
+// it participates in ListFacts / GlobalSearch again. It does NOT recompute
+// cluster centroids because membership is unchanged — only a flag flips.
+func (s *Server) handleUnsupersede(ctx context.Context, _ *mcpsdk.CallToolRequest, in UnsupersedeInput) (*mcpsdk.CallToolResult, UnsupersedeOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, UnsupersedeOutput{}, nil
+	}
+
+	if in.FactID == "" {
+		return nil, UnsupersedeOutput{}, fmt.Errorf("fact_id is required")
+	}
+
+	// GetFact returns (nil, nil) for IDs that aren't facts (including
+	// episode IDs — they're stored in a different table). That's enough of
+	// a not-found signal for the spec: "ID does not name a fact" is
+	// indistinguishable from "ID does not exist" at this layer.
+	fact, err := s.store.GetFact(ctx, in.FactID)
+	if err != nil {
+		return nil, UnsupersedeOutput{}, fmt.Errorf("get fact: %w", err)
+	}
+	if fact == nil {
+		return nil, UnsupersedeOutput{}, fmt.Errorf("fact not found: %s", in.FactID)
+	}
+	if fact.SupersededBy == nil {
+		return nil, UnsupersedeOutput{}, fmt.Errorf("fact is not superseded")
+	}
+
+	prev, err := s.store.ClearFactSuperseded(ctx, in.FactID)
+	if err != nil {
+		return nil, UnsupersedeOutput{}, fmt.Errorf("clear fact superseded: %w", err)
+	}
+
+	out := UnsupersedeOutput{
+		FactID:                 in.FactID,
+		PreviouslySupersededBy: prev,
+	}
+
+	// If the superseder is itself still active (its superseded_by is nil),
+	// we now have two coexisting facts in the same subtype that originally
+	// conflicted. Warn the operator so they can reconcile.
+	super, err := s.store.GetFact(ctx, prev)
+	if err != nil {
+		// Don't fail the overall op — the revival succeeded; log and
+		// leave Warning empty.
+		s.logger.Warn("memory_unsupersede: get superseder failed", "id", prev, "err", err)
+	} else if super != nil && super.SupersededBy == nil {
+		out.Warning = fmt.Sprintf(
+			"both fact %s and fact %s are now active and may be treated as duplicates; consider memory_forget or memory_update_content on one of them",
+			in.FactID, prev,
+		)
+	}
+
+	s.logger.Info("memory_unsupersede", "fact_id", in.FactID, "previously_superseded_by", prev, "warning", out.Warning != "")
+	return nil, out, nil
+}
