@@ -633,7 +633,7 @@ func TestSQLiteDeleteEpisode(t *testing.T) {
 		t.Fatalf("InsertEpisode: %v", err)
 	}
 
-	if err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
+	if _, err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
 		t.Fatalf("LinkFactEpisode: %v", err)
 	}
 
@@ -680,7 +680,7 @@ func TestSQLiteLinkFactEpisode_Insert(t *testing.T) {
 		t.Fatalf("InsertEpisode: %v", err)
 	}
 
-	if err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
+	if _, err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
 		t.Fatalf("LinkFactEpisode: %v", err)
 	}
 
@@ -736,7 +736,7 @@ func TestSQLiteLinkFactEpisode_CascadeOnFactDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertEpisode: %v", err)
 	}
-	if err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
+	if _, err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
 		t.Fatalf("LinkFactEpisode: %v", err)
 	}
 
@@ -766,7 +766,7 @@ func TestSQLiteLinkFactEpisode_CascadeOnEpisodeDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertEpisode: %v", err)
 	}
-	if err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
+	if _, err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
 		t.Fatalf("LinkFactEpisode: %v", err)
 	}
 
@@ -781,6 +781,91 @@ func TestSQLiteLinkFactEpisode_CascadeOnEpisodeDelete(t *testing.T) {
 	}
 	if len(links) != 0 {
 		t.Errorf("expected 0 links after episode delete, got %d", len(links))
+	}
+}
+
+// --- Phase 4A: LinkFactEpisode / UnlinkFactEpisode idempotency ---
+
+func TestSQLiteLinkFactEpisode_CreatedFlag(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	factID, err := s.InsertFact(ctx, testdataFacts()[0])
+	if err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+	epID, err := s.InsertEpisode(ctx, testdataEpisodes()[0])
+	if err != nil {
+		t.Fatalf("InsertEpisode: %v", err)
+	}
+
+	created, err := s.LinkFactEpisode(ctx, factID, epID, "evidence")
+	if err != nil {
+		t.Fatalf("LinkFactEpisode: %v", err)
+	}
+	if !created {
+		t.Error("first LinkFactEpisode: created = false, want true")
+	}
+
+	created, err = s.LinkFactEpisode(ctx, factID, epID, "evidence")
+	if err != nil {
+		t.Fatalf("LinkFactEpisode repeat: %v", err)
+	}
+	if created {
+		t.Error("repeat LinkFactEpisode: created = true, want false")
+	}
+}
+
+func TestSQLiteUnlinkFactEpisode(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	factID, err := s.InsertFact(ctx, testdataFacts()[0])
+	if err != nil {
+		t.Fatalf("InsertFact: %v", err)
+	}
+	epID, err := s.InsertEpisode(ctx, testdataEpisodes()[0])
+	if err != nil {
+		t.Fatalf("InsertEpisode: %v", err)
+	}
+
+	// Unlink with no existing link is a no-op.
+	deleted, err := s.UnlinkFactEpisode(ctx, factID, epID)
+	if err != nil {
+		t.Fatalf("UnlinkFactEpisode (absent): %v", err)
+	}
+	if deleted {
+		t.Error("UnlinkFactEpisode (absent): deleted = true, want false")
+	}
+
+	// Create the link, then unlink it.
+	if _, err := s.LinkFactEpisode(ctx, factID, epID, "evidence"); err != nil {
+		t.Fatalf("LinkFactEpisode: %v", err)
+	}
+	deleted, err = s.UnlinkFactEpisode(ctx, factID, epID)
+	if err != nil {
+		t.Fatalf("UnlinkFactEpisode: %v", err)
+	}
+	if !deleted {
+		t.Error("UnlinkFactEpisode: deleted = false, want true")
+	}
+
+	// Verify link is gone.
+	links, err := s.GetFactLinks(ctx, factID)
+	if err != nil {
+		t.Fatalf("GetFactLinks after unlink: %v", err)
+	}
+	if len(links) != 0 {
+		t.Errorf("expected 0 links after unlink, got %d", len(links))
+	}
+
+	// Second unlink is a no-op.
+	deleted, err = s.UnlinkFactEpisode(ctx, factID, epID)
+	if err != nil {
+		t.Fatalf("UnlinkFactEpisode repeat: %v", err)
+	}
+	if deleted {
+		t.Error("UnlinkFactEpisode repeat: deleted = true, want false")
 	}
 }
 

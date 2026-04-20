@@ -2013,3 +2013,229 @@ func (s *Server) handleUnsupersede(ctx context.Context, _ *mcpsdk.CallToolReques
 	s.logger.Info("memory_unsupersede", "fact_id", in.FactID, "previously_superseded_by", prev, "warning", out.Warning != "")
 	return nil, out, nil
 }
+
+// --- memory_link / memory_unlink / memory_list_links (Phase 4A) ---
+
+// LinkInput is the input schema for the memory_link tool.
+type LinkInput struct {
+	FactID    string `json:"fact_id" jsonschema:"L2 fact ID"`
+	EpisodeID string `json:"episode_id" jsonschema:"L3 episode ID"`
+	LinkType  string `json:"link_type,omitempty" jsonschema:"link type label (default \"evidence\")"`
+}
+
+// LinkOutput is the output schema for the memory_link tool.
+type LinkOutput struct {
+	FactID    string `json:"fact_id"`
+	EpisodeID string `json:"episode_id"`
+	LinkType  string `json:"link_type"`
+	Created   bool   `json:"created"`
+}
+
+// UnlinkInput is the input schema for the memory_unlink tool.
+type UnlinkInput struct {
+	FactID    string `json:"fact_id" jsonschema:"L2 fact ID"`
+	EpisodeID string `json:"episode_id" jsonschema:"L3 episode ID"`
+}
+
+// UnlinkOutput is the output schema for the memory_unlink tool.
+type UnlinkOutput struct {
+	FactID    string `json:"fact_id"`
+	EpisodeID string `json:"episode_id"`
+	Deleted   bool   `json:"deleted"`
+}
+
+// ListLinksInput is the input schema for the memory_list_links tool.
+type ListLinksInput struct {
+	MemoryID string `json:"memory_id" jsonschema:"fact or episode ID"`
+}
+
+// LinkDetail describes a single link from the perspective of the queried memory.
+// ID is the OTHER side of the link.
+type LinkDetail struct {
+	ID             string `json:"id"`
+	Layer          string `json:"layer"`
+	LinkType       string `json:"link_type"`
+	ContentPreview string `json:"content_preview"`
+}
+
+// ListLinksOutput is the output schema for the memory_list_links tool.
+type ListLinksOutput struct {
+	MemoryID string       `json:"memory_id"`
+	Layer    string       `json:"layer"`
+	Links    []LinkDetail `json:"links"`
+}
+
+// linkPreviewMax is the max length of the content_preview field in LinkDetail.
+const linkPreviewMax = 120
+
+// truncatePreview trims s to at most n runes, appending nothing — the spec
+// simply says "truncated to 120 chars." A char here is a byte for simplicity
+// (same convention used elsewhere in the codebase for length limits).
+func truncatePreview(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+func (s *Server) handleLink(ctx context.Context, _ *mcpsdk.CallToolRequest, in LinkInput) (*mcpsdk.CallToolResult, LinkOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, LinkOutput{}, nil
+	}
+
+	if in.FactID == "" {
+		return nil, LinkOutput{}, fmt.Errorf("fact_id is required")
+	}
+	if in.EpisodeID == "" {
+		return nil, LinkOutput{}, fmt.Errorf("episode_id is required")
+	}
+
+	linkType := in.LinkType
+	if linkType == "" {
+		linkType = "evidence"
+	}
+
+	// Validate fact_id is a fact (not an episode).
+	fact, err := s.store.GetFact(ctx, in.FactID)
+	if err != nil {
+		return nil, LinkOutput{}, fmt.Errorf("get fact: %w", err)
+	}
+	if fact == nil {
+		// Disambiguate: is this ID an episode?
+		ep, _ := s.store.GetEpisode(ctx, in.FactID)
+		if ep != nil {
+			return nil, LinkOutput{}, fmt.Errorf("fact_id %s is an episode, not a fact", in.FactID)
+		}
+		return nil, LinkOutput{}, fmt.Errorf("fact not found: %s", in.FactID)
+	}
+
+	// Validate episode_id is an episode (not a fact).
+	ep, err := s.store.GetEpisode(ctx, in.EpisodeID)
+	if err != nil {
+		return nil, LinkOutput{}, fmt.Errorf("get episode: %w", err)
+	}
+	if ep == nil {
+		other, _ := s.store.GetFact(ctx, in.EpisodeID)
+		if other != nil {
+			return nil, LinkOutput{}, fmt.Errorf("episode_id %s is a fact, not an episode", in.EpisodeID)
+		}
+		return nil, LinkOutput{}, fmt.Errorf("episode not found: %s", in.EpisodeID)
+	}
+
+	created, err := s.store.LinkFactEpisode(ctx, in.FactID, in.EpisodeID, linkType)
+	if err != nil {
+		return nil, LinkOutput{}, fmt.Errorf("link fact episode: %w", err)
+	}
+
+	s.logger.Info("memory_link", "fact_id", in.FactID, "episode_id", in.EpisodeID, "link_type", linkType, "created", created)
+	return nil, LinkOutput{
+		FactID:    in.FactID,
+		EpisodeID: in.EpisodeID,
+		LinkType:  linkType,
+		Created:   created,
+	}, nil
+}
+
+func (s *Server) handleUnlink(ctx context.Context, _ *mcpsdk.CallToolRequest, in UnlinkInput) (*mcpsdk.CallToolResult, UnlinkOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, UnlinkOutput{}, nil
+	}
+
+	if in.FactID == "" {
+		return nil, UnlinkOutput{}, fmt.Errorf("fact_id is required")
+	}
+	if in.EpisodeID == "" {
+		return nil, UnlinkOutput{}, fmt.Errorf("episode_id is required")
+	}
+
+	deleted, err := s.store.UnlinkFactEpisode(ctx, in.FactID, in.EpisodeID)
+	if err != nil {
+		return nil, UnlinkOutput{}, fmt.Errorf("unlink fact episode: %w", err)
+	}
+
+	s.logger.Info("memory_unlink", "fact_id", in.FactID, "episode_id", in.EpisodeID, "deleted", deleted)
+	return nil, UnlinkOutput{
+		FactID:    in.FactID,
+		EpisodeID: in.EpisodeID,
+		Deleted:   deleted,
+	}, nil
+}
+
+func (s *Server) handleListLinks(ctx context.Context, _ *mcpsdk.CallToolRequest, in ListLinksInput) (*mcpsdk.CallToolResult, ListLinksOutput, error) {
+	if s.cfg.Server.Disabled {
+		return &mcpsdk.CallToolResult{
+			Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: `{"status":"disabled"}`}},
+		}, ListLinksOutput{}, nil
+	}
+
+	if in.MemoryID == "" {
+		return nil, ListLinksOutput{}, fmt.Errorf("memory_id is required")
+	}
+
+	// Try fact first.
+	fact, err := s.store.GetFact(ctx, in.MemoryID)
+	if err != nil {
+		return nil, ListLinksOutput{}, fmt.Errorf("get fact: %w", err)
+	}
+	if fact != nil {
+		epLinks, err := s.store.GetFactLinks(ctx, fact.ID)
+		if err != nil {
+			return nil, ListLinksOutput{}, fmt.Errorf("get fact links: %w", err)
+		}
+		details := make([]LinkDetail, 0, len(epLinks))
+		for _, l := range epLinks {
+			preview := ""
+			if l.Episode != nil {
+				preview = truncatePreview(memory.Candidate{Episode: l.Episode}.Content(), linkPreviewMax)
+			}
+			details = append(details, LinkDetail{
+				ID:             l.EpisodeID,
+				Layer:          string(memory.TypeL3Episodic),
+				LinkType:       l.LinkType,
+				ContentPreview: preview,
+			})
+		}
+		s.logger.Info("memory_list_links", "memory_id", fact.ID, "layer", "l2_semantic", "count", len(details))
+		return nil, ListLinksOutput{
+			MemoryID: fact.ID,
+			Layer:    string(memory.TypeL2Semantic),
+			Links:    details,
+		}, nil
+	}
+
+	ep, err := s.store.GetEpisode(ctx, in.MemoryID)
+	if err != nil {
+		return nil, ListLinksOutput{}, fmt.Errorf("get episode: %w", err)
+	}
+	if ep != nil {
+		factLinks, err := s.store.GetEpisodeLinks(ctx, ep.ID)
+		if err != nil {
+			return nil, ListLinksOutput{}, fmt.Errorf("get episode links: %w", err)
+		}
+		details := make([]LinkDetail, 0, len(factLinks))
+		for _, l := range factLinks {
+			preview := ""
+			if l.Fact != nil {
+				preview = truncatePreview(l.Fact.Content, linkPreviewMax)
+			}
+			details = append(details, LinkDetail{
+				ID:             l.FactID,
+				Layer:          string(memory.TypeL2Semantic),
+				LinkType:       l.LinkType,
+				ContentPreview: preview,
+			})
+		}
+		s.logger.Info("memory_list_links", "memory_id", ep.ID, "layer", "l3_episodic", "count", len(details))
+		return nil, ListLinksOutput{
+			MemoryID: ep.ID,
+			Layer:    string(memory.TypeL3Episodic),
+			Links:    details,
+		}, nil
+	}
+
+	return nil, ListLinksOutput{}, fmt.Errorf("memory not found: %s", in.MemoryID)
+}

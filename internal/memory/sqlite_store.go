@@ -705,18 +705,37 @@ func (s *sqliteStore) CountEpisodesByCluster(ctx context.Context, clusterID stri
 
 // --- Fact <-> Episode cross-type links ---
 
-func (s *sqliteStore) LinkFactEpisode(ctx context.Context, factID, episodeID, linkType string) error {
+func (s *sqliteStore) LinkFactEpisode(ctx context.Context, factID, episodeID, linkType string) (bool, error) {
 	if linkType == "" {
 		linkType = "evidence"
 	}
-	_, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO fact_episode_links (fact_id, episode_id, link_type) VALUES (?, ?, ?)`,
 		factID, episodeID, linkType,
 	)
 	if err != nil {
-		return fmt.Errorf("sqlite store: link fact episode: %w", err)
+		return false, fmt.Errorf("sqlite store: link fact episode: %w", err)
 	}
-	return nil
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("sqlite store: link fact episode: rows affected: %w", err)
+	}
+	return affected > 0, nil
+}
+
+func (s *sqliteStore) UnlinkFactEpisode(ctx context.Context, factID, episodeID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM fact_episode_links WHERE fact_id = ? AND episode_id = ?`,
+		factID, episodeID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("sqlite store: unlink fact episode: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("sqlite store: unlink fact episode: rows affected: %w", err)
+	}
+	return affected > 0, nil
 }
 
 func (s *sqliteStore) GetFactLinks(ctx context.Context, factID string) ([]EpisodeLink, error) {

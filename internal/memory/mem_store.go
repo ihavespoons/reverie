@@ -621,14 +621,36 @@ func (m *memStore) addLink(factID, episodeID, linkType string) {
 	})
 }
 
-func (m *memStore) LinkFactEpisode(_ context.Context, factID, episodeID, linkType string) error {
+func (m *memStore) LinkFactEpisode(_ context.Context, factID, episodeID, linkType string) (bool, error) {
 	if linkType == "" {
 		linkType = "evidence"
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.addLink(factID, episodeID, linkType)
-	return nil
+	// Check for an existing link; if present, this is a no-op.
+	for _, l := range m.links {
+		if l.FactID == factID && l.EpisodeID == episodeID {
+			return false, nil
+		}
+	}
+	m.links = append(m.links, linkRow{
+		FactID:    factID,
+		EpisodeID: episodeID,
+		LinkType:  linkType,
+	})
+	return true, nil
+}
+
+func (m *memStore) UnlinkFactEpisode(_ context.Context, factID, episodeID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, l := range m.links {
+		if l.FactID == factID && l.EpisodeID == episodeID {
+			m.links = append(m.links[:i], m.links[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (m *memStore) GetFactLinks(_ context.Context, factID string) ([]EpisodeLink, error) {

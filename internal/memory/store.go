@@ -70,7 +70,14 @@ type Store interface {
 
 	// LinkFactEpisode creates a link between a fact and an episode with the given
 	// link type (e.g. "evidence"). Duplicate links are silently ignored.
-	LinkFactEpisode(ctx context.Context, factID, episodeID, linkType string) error
+	// Returns created=true when a new row was inserted, created=false when the
+	// link already existed (idempotent no-op).
+	LinkFactEpisode(ctx context.Context, factID, episodeID, linkType string) (created bool, err error)
+
+	// UnlinkFactEpisode removes the link between a fact and an episode.
+	// Returns deleted=true when a row was removed, deleted=false when no such
+	// link existed (idempotent).
+	UnlinkFactEpisode(ctx context.Context, factID, episodeID string) (deleted bool, err error)
 
 	// GetFactLinks returns the episodes linked to the given fact, eager-loaded
 	// via a single JOIN query.

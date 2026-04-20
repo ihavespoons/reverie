@@ -245,4 +245,43 @@ func (s *Server) registerTools(srv *mcpsdk.Server) {
 			Title:         "Unsupersede fact",
 		},
 	}, s.handleUnsupersede)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_link",
+		Description: "Create a cross-type link between an L2 fact and an L3 episode. " +
+			"link_type defaults to \"evidence\"; any non-empty string is accepted. " +
+			"Idempotent: repeating the same link returns created=false. " +
+			"Both IDs must resolve to memories of the correct layer.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:   readOnlyFalse,
+			IdempotentHint: true,
+			OpenWorldHint:  &openWorld,
+			Title:          "Link fact and episode",
+		},
+	}, s.handleLink)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_unlink",
+		Description: "Remove a cross-type link between an L2 fact and an L3 episode. " +
+			"Idempotent: returns deleted=false when no such link exists. " +
+			"Does not require the IDs to resolve to existing memories — an orphan link row can exist before cascade runs.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:   readOnlyFalse,
+			IdempotentHint: true,
+			OpenWorldHint:  &openWorld,
+			Title:          "Unlink fact and episode",
+		},
+	}, s.handleUnlink)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name: "memory_list_links",
+		Description: "List all cross-type links for a given memory. Resolves memory_id as a fact first, then as an episode. " +
+			"Returns the OTHER side of each link with layer, link_type, and a 120-char content preview. " +
+			"Errors if the memory ID does not exist.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			ReadOnlyHint:  true,
+			OpenWorldHint: &openWorld,
+			Title:         "List memory links",
+		},
+	}, s.handleListLinks)
 }

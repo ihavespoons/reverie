@@ -2596,7 +2596,7 @@ func TestHandleGet_LinksBidirectional(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleWrite episode: %v", err)
 	}
-	if err := s.store.LinkFactEpisode(ctx, fOut.ID, eOut.ID, "related"); err != nil {
+	if _, err := s.store.LinkFactEpisode(ctx, fOut.ID, eOut.ID, "related"); err != nil {
 		t.Fatalf("LinkFactEpisode: %v", err)
 	}
 
@@ -4969,5 +4969,309 @@ func TestHandleUnsupersede_ListFactsReflectsRevival(t *testing.T) {
 	}
 	if !sawNew {
 		t.Error("post: ListFacts did not include superseder fact")
+	}
+}
+
+// --- Phase 4A: memory_link / memory_unlink / memory_list_links tests ---
+
+// seedLinkServer builds a test server with one fact and one episode and returns
+// the (server, factID, episodeID).
+func seedLinkServer(t *testing.T) (*Server, string, string) {
+	t.Helper()
+	emb := newStubEmbedder(4)
+	emb.vectors["fact content"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["sit1\nact1\nout1\npre1"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	t.Cleanup(func() { s.recallCache.stop() })
+
+	ctx := context.Background()
+	_, fOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact content", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite fact: %v", err)
+	}
+	_, eOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Episode: &EpisodePayload{
+			Situation: "sit1", Action: "act1", Outcome: "out1", Preemptive: "pre1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleWrite episode: %v", err)
+	}
+	return s, fOut.ID, eOut.ID
+}
+
+func TestHandleLink_Created(t *testing.T) {
+	s, factID, epID := seedLinkServer(t)
+	ctx := context.Background()
+
+	_, out, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID})
+	if err != nil {
+		t.Fatalf("handleLink: %v", err)
+	}
+	if !out.Created {
+		t.Error("Created = false on fresh link, want true")
+	}
+	if out.LinkType != "evidence" {
+		t.Errorf("LinkType = %q, want %q (default)", out.LinkType, "evidence")
+	}
+	if out.FactID != factID || out.EpisodeID != epID {
+		t.Errorf("IDs mismatch: fact %q (want %q), episode %q (want %q)",
+			out.FactID, factID, out.EpisodeID, epID)
+	}
+
+	// Link is observable via memory_list_links.
+	_, listOut, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: factID})
+	if err != nil {
+		t.Fatalf("handleListLinks: %v", err)
+	}
+	if len(listOut.Links) != 1 || listOut.Links[0].ID != epID {
+		t.Errorf("list links from fact = %+v, want one link to %s", listOut.Links, epID)
+	}
+}
+
+func TestHandleLink_Idempotent(t *testing.T) {
+	s, factID, epID := seedLinkServer(t)
+	ctx := context.Background()
+
+	_, first, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID})
+	if err != nil {
+		t.Fatalf("handleLink first: %v", err)
+	}
+	if !first.Created {
+		t.Error("first Created = false, want true")
+	}
+
+	_, second, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID})
+	if err != nil {
+		t.Fatalf("handleLink second: %v", err)
+	}
+	if second.Created {
+		t.Error("second Created = true, want false (idempotent)")
+	}
+}
+
+func TestHandleLink_WrongLayerFact(t *testing.T) {
+	s, factID, epID := seedLinkServer(t)
+	ctx := context.Background()
+
+	// factID supplied as episode_id → episode-is-a-fact error.
+	_, _, err := s.handleLink(ctx, nil, LinkInput{FactID: epID, EpisodeID: factID})
+	if err == nil {
+		t.Fatal("expected error when fact_id is an episode")
+	}
+}
+
+func TestHandleLink_NonexistentIDs(t *testing.T) {
+	s, factID, _ := seedLinkServer(t)
+	ctx := context.Background()
+
+	_, _, err := s.handleLink(ctx, nil, LinkInput{FactID: "no-such-fact", EpisodeID: "no-such-ep"})
+	if err == nil {
+		t.Error("expected error for nonexistent fact_id")
+	}
+
+	_, _, err = s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: "no-such-ep"})
+	if err == nil {
+		t.Error("expected error for nonexistent episode_id")
+	}
+}
+
+func TestHandleLink_CustomLinkType(t *testing.T) {
+	s, factID, epID := seedLinkServer(t)
+	ctx := context.Background()
+
+	_, out, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID, LinkType: "cause"})
+	if err != nil {
+		t.Fatalf("handleLink: %v", err)
+	}
+	if out.LinkType != "cause" {
+		t.Errorf("LinkType = %q, want %q", out.LinkType, "cause")
+	}
+
+	// Visible via memory_list_links.
+	_, listOut, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: factID})
+	if err != nil {
+		t.Fatalf("handleListLinks: %v", err)
+	}
+	if len(listOut.Links) != 1 || listOut.Links[0].LinkType != "cause" {
+		t.Errorf("list links = %+v, want one link with link_type=cause", listOut.Links)
+	}
+}
+
+func TestHandleUnlink_Existing(t *testing.T) {
+	s, factID, epID := seedLinkServer(t)
+	ctx := context.Background()
+
+	if _, _, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID}); err != nil {
+		t.Fatalf("handleLink: %v", err)
+	}
+
+	_, out, err := s.handleUnlink(ctx, nil, UnlinkInput{FactID: factID, EpisodeID: epID})
+	if err != nil {
+		t.Fatalf("handleUnlink: %v", err)
+	}
+	if !out.Deleted {
+		t.Error("Deleted = false, want true")
+	}
+
+	// Confirm the link is gone.
+	_, listOut, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: factID})
+	if err != nil {
+		t.Fatalf("handleListLinks: %v", err)
+	}
+	if len(listOut.Links) != 0 {
+		t.Errorf("links after unlink = %+v, want empty", listOut.Links)
+	}
+}
+
+func TestHandleUnlink_Missing(t *testing.T) {
+	s, factID, epID := seedLinkServer(t)
+	ctx := context.Background()
+
+	_, out, err := s.handleUnlink(ctx, nil, UnlinkInput{FactID: factID, EpisodeID: epID})
+	if err != nil {
+		t.Fatalf("handleUnlink (no link): %v", err)
+	}
+	if out.Deleted {
+		t.Error("Deleted = true, want false (no link existed)")
+	}
+}
+
+func TestHandleListLinks_FromFact(t *testing.T) {
+	s, factID, epID := seedLinkServer(t)
+	ctx := context.Background()
+
+	if _, _, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID, LinkType: "evidence"}); err != nil {
+		t.Fatalf("handleLink: %v", err)
+	}
+
+	_, out, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: factID})
+	if err != nil {
+		t.Fatalf("handleListLinks: %v", err)
+	}
+	if out.Layer != "l2_semantic" {
+		t.Errorf("queried-layer = %q, want l2_semantic", out.Layer)
+	}
+	if len(out.Links) != 1 {
+		t.Fatalf("links = %d, want 1", len(out.Links))
+	}
+	if out.Links[0].ID != epID || out.Links[0].Layer != "l3_episodic" {
+		t.Errorf("link = %+v, want ID=%s layer=l3_episodic", out.Links[0], epID)
+	}
+	if out.Links[0].ContentPreview == "" {
+		t.Error("ContentPreview empty, want episode content")
+	}
+}
+
+func TestHandleListLinks_FromEpisode(t *testing.T) {
+	s, factID, epID := seedLinkServer(t)
+	ctx := context.Background()
+
+	if _, _, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID}); err != nil {
+		t.Fatalf("handleLink: %v", err)
+	}
+
+	_, out, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: epID})
+	if err != nil {
+		t.Fatalf("handleListLinks: %v", err)
+	}
+	if out.Layer != "l3_episodic" {
+		t.Errorf("queried-layer = %q, want l3_episodic", out.Layer)
+	}
+	if len(out.Links) != 1 {
+		t.Fatalf("links = %d, want 1", len(out.Links))
+	}
+	if out.Links[0].ID != factID || out.Links[0].Layer != "l2_semantic" {
+		t.Errorf("link = %+v, want ID=%s layer=l2_semantic", out.Links[0], factID)
+	}
+	if out.Links[0].ContentPreview != "fact content" {
+		t.Errorf("ContentPreview = %q, want \"fact content\"", out.Links[0].ContentPreview)
+	}
+}
+
+func TestHandleListLinks_Empty(t *testing.T) {
+	s, factID, _ := seedLinkServer(t)
+	ctx := context.Background()
+
+	_, out, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: factID})
+	if err != nil {
+		t.Fatalf("handleListLinks: %v", err)
+	}
+	if out.Links == nil {
+		t.Error("Links = nil, want empty non-nil slice")
+	}
+	if len(out.Links) != 0 {
+		t.Errorf("len(Links) = %d, want 0", len(out.Links))
+	}
+}
+
+func TestHandleListLinks_NotFound(t *testing.T) {
+	s, _, _ := seedLinkServer(t)
+	ctx := context.Background()
+
+	_, _, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: "no-such-id"})
+	if err == nil {
+		t.Error("expected error for nonexistent memory_id")
+	}
+}
+
+func TestHandleListLinks_CascadeAfterDeleteFact(t *testing.T) {
+	s, factID, epID := seedLinkServer(t)
+	ctx := context.Background()
+
+	if _, _, err := s.handleLink(ctx, nil, LinkInput{FactID: factID, EpisodeID: epID}); err != nil {
+		t.Fatalf("handleLink: %v", err)
+	}
+
+	// Delete the fact directly — the link row should cascade away.
+	if err := s.store.DeleteFact(ctx, factID); err != nil {
+		t.Fatalf("DeleteFact: %v", err)
+	}
+
+	// Episode side should now report no links.
+	_, out, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: epID})
+	if err != nil {
+		t.Fatalf("handleListLinks: %v", err)
+	}
+	if len(out.Links) != 0 {
+		t.Errorf("links after cascade = %+v, want empty", out.Links)
+	}
+}
+
+// TestWriteEpisodeWithLinkedFactIDs_StillWorks guards against regressions in the
+// episode-write path after the LinkFactEpisode signature change. Even though
+// InsertEpisode uses its own inline INSERT (not LinkFactEpisode), we verify
+// that EpisodePayload.LinkedFactIDs still establishes links observable via
+// memory_list_links.
+func TestWriteEpisodeWithLinkedFactIDs_StillWorks(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["fact x"] = []float32{0.5, 0.5, 0.0, 0.0}
+	emb.vectors["s\na\no\np"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	_, fOut, err := s.handleWrite(ctx, nil, WriteInput{Content: "fact x", Type: "project"})
+	if err != nil {
+		t.Fatalf("handleWrite fact: %v", err)
+	}
+	_, eOut, err := s.handleWrite(ctx, nil, WriteInput{
+		Type: "feedback",
+		Episode: &EpisodePayload{
+			Situation: "s", Action: "a", Outcome: "o", Preemptive: "p",
+			LinkedFactIDs: []string{fOut.ID},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleWrite episode: %v", err)
+	}
+
+	_, out, err := s.handleListLinks(ctx, nil, ListLinksInput{MemoryID: eOut.ID})
+	if err != nil {
+		t.Fatalf("handleListLinks: %v", err)
+	}
+	if len(out.Links) != 1 || out.Links[0].ID != fOut.ID {
+		t.Errorf("episode links = %+v, want one link to %s", out.Links, fOut.ID)
 	}
 }
