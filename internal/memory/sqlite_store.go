@@ -1351,6 +1351,109 @@ func (s *sqliteStore) ListDailyStats(ctx context.Context, from, to string) ([]Da
 	return out, nil
 }
 
+// GetLastTick returns the last decay tick timestamp from the decay_state
+// singleton row. A NULL last_tick (fresh DB, no tick ever) is surfaced as a
+// zero-value time.Time so the caller can check with .IsZero() without
+// disambiguating sentinel errors. RFC3339 is the on-disk format (same as the
+// rest of this package's timestamps).
+func (s *sqliteStore) GetLastTick(ctx context.Context) (time.Time, error) {
+	var raw sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT last_tick FROM decay_state WHERE id = 1`,
+	).Scan(&raw)
+	if err == sql.ErrNoRows {
+		// Migration 3 seeds id=1, so this should not happen in production.
+		// Treat it the same as a NULL last_tick rather than erroring — the
+		// status handler just wants "zero or a timestamp".
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("sqlite store: get last tick: %w", err)
+	}
+	if !raw.Valid || raw.String == "" {
+		return time.Time{}, nil
+	}
+	t, perr := time.Parse(timeFormat, raw.String)
+	if perr != nil {
+		return time.Time{}, fmt.Errorf("sqlite store: get last tick: parse %q: %w", raw.String, perr)
+	}
+	return t, nil
+}
+
+// SetLastTick persists the tick timestamp in ISO8601 UTC (RFC3339) on the
+// singleton decay_state row. The row is seeded by migration 3, so UPDATE
+// without fallback INSERT is sufficient.
+func (s *sqliteStore) SetLastTick(ctx context.Context, t time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE decay_state SET last_tick = ? WHERE id = 1`,
+		t.UTC().Format(timeFormat),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite store: set last tick: %w", err)
+	}
+	return nil
+}
+
+// SupersedeLongestChain computes the length of the longest chain of facts
+// linked by superseded_by. The recursive CTE starts from terminals (facts
+// that are themselves NOT superseded but that ARE the target of at least one
+// supersede edge) at depth=1 and walks backward through superseded_by edges,
+// incrementing depth per hop.
+//
+// Semantics: for A -> B -> C where A.superseded_by=B and B.superseded_by=C,
+// C is the terminal head of the chain (depth=1), B is the intermediate
+// (depth=2), and A is the original (depth=3). The function returns 3.
+// Intuition: the number is the total count of facts participating in the
+// longest chain, including the currently-active head.
+//
+// NOTE (5A timeout test skipped): the 100ms guardrail below is hard to
+// exercise without injecting a fake slow query hook. Given the CTE is
+// trivially fast at realistic scale and the handler already degrades
+// gracefully on DeadlineExceeded, the integration test for that branch was
+// intentionally skipped; see the 5A task brief in docs/design/.
+func (s *sqliteStore) SupersedeLongestChain(ctx context.Context) (int, error) {
+	childCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+
+	const query = `
+WITH RECURSIVE chain(id, depth) AS (
+  SELECT id, 1 FROM facts
+    WHERE superseded_by IS NULL
+      AND id IN (
+        SELECT superseded_by FROM facts WHERE superseded_by IS NOT NULL
+      )
+  UNION ALL
+  SELECT f.id, chain.depth + 1 FROM facts f
+    JOIN chain ON f.superseded_by = chain.id
+)
+SELECT COALESCE(MAX(depth), 0) FROM chain`
+
+	var n int
+	err := s.db.QueryRowContext(childCtx, query).Scan(&n)
+	if err != nil {
+		// Propagate DeadlineExceeded untouched so the status handler can tag
+		// the subsection degraded.
+		if childCtx.Err() == context.DeadlineExceeded {
+			return 0, context.DeadlineExceeded
+		}
+		return 0, fmt.Errorf("sqlite store: supersede longest chain: %w", err)
+	}
+	return n, nil
+}
+
+// CountSupersededFacts returns the number of facts with a non-NULL
+// superseded_by. Used by the status resource's supersede subsection.
+func (s *sqliteStore) CountSupersededFacts(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM facts WHERE superseded_by IS NOT NULL`,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite store: count superseded facts: %w", err)
+	}
+	return n, nil
+}
+
 func (s *sqliteStore) Close() error {
 	return s.db.Close()
 }

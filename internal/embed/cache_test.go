@@ -276,3 +276,49 @@ func TestCacheDelegatesDimensionsAndModel(t *testing.T) {
 		t.Errorf("Model() = %q, want %q", got, "test-model")
 	}
 }
+
+func TestCacheStatsFresh(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer d.Close()
+
+	inner := &fakeProvider{model: "test-model", dim: 4}
+	cached := NewCachedProvider(inner, d)
+
+	stats := cached.Stats()
+	if stats.Hits != 0 || stats.Misses != 0 {
+		t.Errorf("fresh Stats() = %+v, want {0, 0}", stats)
+	}
+}
+
+func TestCacheStatsCountsHitsAndMisses(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer d.Close()
+
+	inner := &fakeProvider{model: "test-model", dim: 4}
+	cached := NewCachedProvider(inner, d)
+
+	// Two misses: first call, both texts go to inner.
+	if _, err := cached.Embed(context.Background(), []string{"alpha", "beta"}); err != nil {
+		t.Fatalf("first Embed: %v", err)
+	}
+	// One hit: "alpha" is cached from the previous call.
+	if _, err := cached.Embed(context.Background(), []string{"alpha"}); err != nil {
+		t.Fatalf("second Embed: %v", err)
+	}
+
+	stats := cached.Stats()
+	if stats.Hits != 1 {
+		t.Errorf("Stats().Hits = %d, want 1", stats.Hits)
+	}
+	if stats.Misses != 2 {
+		t.Errorf("Stats().Misses = %d, want 2", stats.Misses)
+	}
+}

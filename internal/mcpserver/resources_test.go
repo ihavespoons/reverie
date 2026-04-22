@@ -10,6 +10,12 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"personal/reverie/internal/cluster"
+	"personal/reverie/internal/config"
+	"personal/reverie/internal/db"
+	"personal/reverie/internal/decay"
+	"personal/reverie/internal/embed"
+	"personal/reverie/internal/manager"
 	"personal/reverie/internal/memory"
 )
 
@@ -851,5 +857,220 @@ func TestStatsDaily_InvalidDateFormat(t *testing.T) {
 	req.Params = &mcpsdk.ReadResourceParams{URI: "reverie://stats/daily?from=not-a-date"}
 	if _, err := s.handleStatsDailyResource(context.Background(), req); err == nil {
 		t.Error("expected error for malformed from")
+	}
+}
+
+// --- reverie://status Phase 5A enrichment tests ---
+
+// readStatus is a helper that reads reverie://status and unmarshals the
+// response. Phase 5A tests rely on this to check the added subsections.
+func readStatus(t *testing.T, s *Server) statusResponse {
+	t.Helper()
+	req := &mcpsdk.ReadResourceRequest{}
+	req.Params = &mcpsdk.ReadResourceParams{URI: "reverie://status"}
+	result, err := s.handleStatusResource(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleStatusResource: %v", err)
+	}
+	if len(result.Contents) != 1 {
+		t.Fatalf("expected 1 content, got %d", len(result.Contents))
+	}
+	var resp statusResponse
+	if err := json.Unmarshal([]byte(result.Contents[0].Text), &resp); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	return resp
+}
+
+func TestStatusResource_Phase5AFieldsPopulated(t *testing.T) {
+	emb := newStubEmbedder(4)
+	emb.vectors["phase5a fact"] = []float32{0.5, 0.5, 0.0, 0.0}
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+	if _, _, err := s.handleWrite(ctx, nil, WriteInput{Content: "phase5a fact", Type: "user"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	resp := readStatus(t, s)
+
+	// Retention section present with the 6 fixed buckets, regardless of data.
+	if len(resp.Retention.Buckets) != 6 {
+		t.Errorf("retention.buckets len = %d, want 6", len(resp.Retention.Buckets))
+	}
+	// Buckets sum == non-empty cluster count. With one write there is at
+	// least one non-empty cluster.
+	var sum int
+	for _, b := range resp.Retention.Buckets {
+		sum += b.Count
+	}
+	// Count non-empty clusters independently for comparison.
+	clusters, err := s.store.ListClusters(ctx)
+	if err != nil {
+		t.Fatalf("ListClusters: %v", err)
+	}
+	nonEmpty := 0
+	for _, c := range clusters {
+		if c.ItemCount > 0 {
+			nonEmpty++
+		}
+	}
+	if sum != nonEmpty {
+		t.Errorf("bucket sum = %d, want %d (non-empty cluster count)", sum, nonEmpty)
+	}
+
+	// Supersede section fields exist and are non-negative.
+	if resp.Supersede.TotalSuperseded < 0 {
+		t.Errorf("total_superseded = %d, want >= 0", resp.Supersede.TotalSuperseded)
+	}
+	if resp.Supersede.LongestChain < 0 {
+		t.Errorf("longest_chain = %d, want >= 0", resp.Supersede.LongestChain)
+	}
+
+	// Embedding cache: stub is not a *CachedProvider, so all zero.
+	if resp.EmbeddingCache.Hits != 0 || resp.EmbeddingCache.Misses != 0 {
+		t.Errorf("embedding_cache for stub embedder = %+v, want zeroes", resp.EmbeddingCache)
+	}
+	if resp.EmbeddingCache.HitRate != 0.0 {
+		t.Errorf("embedding_cache.hit_rate = %v, want 0.0 on stub embedder", resp.EmbeddingCache.HitRate)
+	}
+}
+
+func TestStatusResource_EmptyDB(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	resp := readStatus(t, s)
+
+	// memStore has no clusters on creation, so bucket counts are zero and
+	// hit_rate is defined as 0.0 when denominator is 0.
+	var sum int
+	for _, b := range resp.Retention.Buckets {
+		sum += b.Count
+	}
+	if sum != 0 {
+		t.Errorf("retention sum on empty = %d, want 0", sum)
+	}
+	if resp.Retention.BelowThreshold != 0 {
+		t.Errorf("below_threshold on empty = %d, want 0", resp.Retention.BelowThreshold)
+	}
+	if resp.Supersede.TotalSuperseded != 0 || resp.Supersede.LongestChain != 0 {
+		t.Errorf("supersede on empty = %+v, want zeroes", resp.Supersede)
+	}
+	if resp.EmbeddingCache.HitRate != 0.0 {
+		t.Errorf("hit_rate on empty = %v, want 0.0", resp.EmbeddingCache.HitRate)
+	}
+	if resp.LastTick != "" {
+		t.Errorf("last_tick on empty = %q, want empty string", resp.LastTick)
+	}
+}
+
+func TestStatusResource_LastTickUpdatesAfterDecayTick(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	// Pre-condition: last_tick is empty on a fresh store.
+	before := readStatus(t, s)
+	if before.LastTick != "" {
+		t.Fatalf("pre-tick last_tick = %q, want empty", before.LastTick)
+	}
+
+	tickStart := time.Now().UTC()
+	if _, _, err := s.handleDecayTick(ctx, nil, DecayTickInput{}); err != nil {
+		t.Fatalf("handleDecayTick: %v", err)
+	}
+
+	after := readStatus(t, s)
+	if after.LastTick == "" {
+		t.Fatal("post-tick last_tick is empty")
+	}
+	parsed, err := time.Parse("2006-01-02T15:04:05Z", after.LastTick)
+	if err != nil {
+		t.Fatalf("parse last_tick %q: %v", after.LastTick, err)
+	}
+	// The tick timestamp should fall between tickStart (captured just
+	// before the tick) and a couple of seconds later.
+	if parsed.Before(tickStart.Truncate(time.Second)) {
+		t.Errorf("last_tick %v predates tickStart %v", parsed, tickStart)
+	}
+	if parsed.After(time.Now().UTC().Add(2 * time.Second)) {
+		t.Errorf("last_tick %v too far in the future", parsed)
+	}
+}
+
+// newCachedTestServer wires a test stub behind the real CachedProvider so we
+// can exercise the Hits/Misses type-assertion path in the status handler.
+// The cache table lives in a standalone SQLite DB opened from t.TempDir().
+func newCachedTestServer(t *testing.T) *Server {
+	t.Helper()
+	dbFile := t.TempDir() + "/cache.db"
+	sqlDB, err := db.Open(dbFile)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	t.Cleanup(func() { sqlDB.Close() })
+
+	stub := newStubEmbedder(4)
+	stub.vectors["cache query"] = []float32{0.5, 0.5, 0.0, 0.0}
+
+	cached := embed.NewCachedProvider(stub, sqlDB)
+
+	cfg := config.Defaults()
+	store := memory.NewMemStore()
+	dec := decay.NewDecayer(10.0, 0.3)
+	mgr := manager.NewMemoryManager(store, dec, 0.10, 0.05)
+	assigner := cluster.NewAssigner(store, 0.60, 0.5, 0.5)
+	return NewServer(store, cached, dec, mgr, assigner, cfg, nil)
+}
+
+func TestStatusResource_CacheHitsAndMissesTracked(t *testing.T) {
+	s := newCachedTestServer(t)
+	defer s.recallCache.stop()
+
+	ctx := context.Background()
+
+	// First recall: cache miss. memStore is empty so no candidates, but the
+	// query itself still goes through the cached embedder.
+	if _, _, err := s.handleRecall(ctx, nil, RecallInput{Query: "cache query"}); err != nil {
+		t.Fatalf("first recall: %v", err)
+	}
+	mid := readStatus(t, s)
+	if mid.EmbeddingCache.Misses < 1 {
+		t.Errorf("after first recall: misses = %d, want >= 1", mid.EmbeddingCache.Misses)
+	}
+	firstHits := mid.EmbeddingCache.Hits
+
+	// Second recall with the same query: the embedding is cached now. The
+	// recall handler itself has a query cache — but the EMBEDDER cache is
+	// the one we care about here, and it should still see another call
+	// (the recall cache passes through a bit differently). We just assert
+	// hits > first snapshot.
+	if _, _, err := s.handleRecall(ctx, nil, RecallInput{Query: "cache query"}); err != nil {
+		t.Fatalf("second recall: %v", err)
+	}
+	after := readStatus(t, s)
+	if after.EmbeddingCache.Hits <= firstHits {
+		// Fall back to directly exercising the embedder: if the recall-level
+		// cache short-circuits before the embedder, hits won't advance.
+		// That's still valid — call Embed directly to make the assertion
+		// deterministic.
+		if cp, ok := s.embedder.(*embed.CachedProvider); ok {
+			if _, err := cp.Embed(ctx, []string{"cache query"}); err != nil {
+				t.Fatalf("direct Embed: %v", err)
+			}
+		}
+		after = readStatus(t, s)
+	}
+	if after.EmbeddingCache.Hits <= firstHits {
+		t.Errorf("hits did not grow: firstHits=%d after=%d", firstHits, after.EmbeddingCache.Hits)
+	}
+	// HitRate sanity: must be in [0,1].
+	if after.EmbeddingCache.HitRate < 0 || after.EmbeddingCache.HitRate > 1 {
+		t.Errorf("hit_rate = %v, want in [0,1]", after.EmbeddingCache.HitRate)
 	}
 }

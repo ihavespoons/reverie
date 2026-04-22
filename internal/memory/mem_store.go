@@ -32,6 +32,9 @@ type memStore struct {
 	episodeOrder []string
 	links        []linkRow
 	clusters     map[string]ClusterNode
+	// lastTick mirrors the sqlite decay_state.last_tick singleton. Zero value
+	// = never ticked.
+	lastTick time.Time
 }
 
 // NewMemStore returns a thread-safe in-memory Store.
@@ -1017,6 +1020,78 @@ func (m *memStore) FindSimilarFacts(_ context.Context, subtype string, queryVec 
 // solely to satisfy the Store interface.
 func (m *memStore) ListDailyStats(_ context.Context, _, _ string) ([]DailyStats, error) {
 	return []DailyStats{}, nil
+}
+
+// GetLastTick returns the last-recorded decay tick time, or zero-value if
+// SetLastTick has never been called on this store.
+func (m *memStore) GetLastTick(_ context.Context) (time.Time, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.lastTick, nil
+}
+
+// SetLastTick records the given tick time. Stored in UTC to match sqliteStore.
+func (m *memStore) SetLastTick(_ context.Context, t time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastTick = t.UTC()
+	return nil
+}
+
+// SupersedeLongestChain walks the in-memory supersede edges to find the
+// longest chain. Semantics match sqliteStore: for A->B->C (A superseded by B,
+// B superseded by C, C terminal) the returned depth is 3 — every fact in the
+// chain is counted, including the current head. A fact with no supersede
+// relationships contributes 0. This is O(N*d) where d is the chain depth —
+// fine for the in-memory test harness.
+func (m *memStore) SupersedeLongestChain(_ context.Context) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	max := 0
+	// For each fact that IS superseded, walk forward through superseded_by
+	// pointers until we hit the terminal. Count every node including the
+	// terminal — that matches the CTE semantics in sqliteStore.
+	for _, f := range m.facts {
+		if f.SupersededBy == nil {
+			continue
+		}
+		depth := 1 // count the starting (superseded) fact
+		visited := map[string]bool{f.ID: true}
+		cur := f
+		for cur.SupersededBy != nil {
+			nextID := *cur.SupersededBy
+			if visited[nextID] {
+				break // cycle guard
+			}
+			visited[nextID] = true
+			next, ok := m.facts[nextID]
+			if !ok {
+				break // dangling pointer
+			}
+			depth++
+			cur = next
+		}
+		if depth > max {
+			max = depth
+		}
+	}
+	return max, nil
+}
+
+// CountSupersededFacts returns the number of facts with a non-nil
+// SupersededBy pointer.
+func (m *memStore) CountSupersededFacts(_ context.Context) (int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	n := 0
+	for _, f := range m.facts {
+		if f.SupersededBy != nil {
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (m *memStore) Close() error {

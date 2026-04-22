@@ -1,6 +1,9 @@
 package memory
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Store defines the persistence interface for the reverie memory system.
 // It covers L2 fact operations, L3 episode operations, cross-type links,
@@ -231,8 +234,42 @@ type Store interface {
 	// in-memory test store) return an empty slice with no error.
 	ListDailyStats(ctx context.Context, from, to string) ([]DailyStats, error)
 
+	// GetLastTick returns the timestamp of the last successful decay tick.
+	// Returns a zero-value time.Time (check via .IsZero()) when no tick has
+	// ever run — the decay_state row is seeded with NULL by migration 3.
+	GetLastTick(ctx context.Context) (time.Time, error)
+
+	// SetLastTick persists the timestamp of the most recent decay tick. The
+	// store writes it as ISO8601 UTC (RFC3339) into decay_state.last_tick
+	// WHERE id=1. Callers pass time.Now().UTC() after a successful tick.
+	SetLastTick(ctx context.Context, t time.Time) error
+
+	// SupersedeLongestChain returns the length of the longest supersede
+	// chain in the facts table. A solitary fact (no supersede relationship)
+	// contributes a chain of length 0 — only chains with at least one
+	// superseded_by edge are counted. Implementations should apply a short
+	// internal timeout (per Phase 5A spec: 100ms) and return
+	// context.DeadlineExceeded if the computation would exceed it, so the
+	// status handler can degrade gracefully.
+	SupersedeLongestChain(ctx context.Context) (int, error)
+
+	// CountSupersededFacts returns the number of facts whose superseded_by
+	// column is non-NULL. Used by reverie://status to report the total
+	// superseded population.
+	CountSupersededFacts(ctx context.Context) (int, error)
+
 	// Close releases any resources held by the store (e.g., database connections).
 	Close() error
+}
+
+// RetentionBucket is a single bar in a retention histogram: the half-open
+// range [Min, Max) along the retention axis (0..1) and the count of clusters
+// whose retention falls inside it. The last bucket in a histogram is
+// inclusive of its Max so retention=1.0 lands somewhere.
+type RetentionBucket struct {
+	Min   float64 `json:"min"`
+	Max   float64 `json:"max"`
+	Count int     `json:"count"`
 }
 
 // DailyStats is a single row of the daily_stats table — per-day counters for

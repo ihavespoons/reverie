@@ -6,23 +6,46 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"personal/reverie/internal/memory"
 )
 
-// cachedProvider wraps an EmbeddingProvider with a SHA-256-keyed SQLite cache
-// backed by the embedding_cache table.
-type cachedProvider struct {
+// CachedProvider wraps an EmbeddingProvider with a SHA-256-keyed SQLite cache
+// backed by the embedding_cache table. Exported so the status handler can
+// type-assert it to expose Stats().
+type CachedProvider struct {
 	inner EmbeddingProvider
 	db    *sql.DB
+
+	// hits / misses are per-text counters updated inside Embed. Cache-hit means
+	// the embedding was served from the embedding_cache table without calling
+	// the inner provider; miss means we had to go to the inner provider.
+	// Counters are in-memory only and reset on server restart.
+	hits   int64
+	misses int64
+}
+
+// ProviderStats is a snapshot of a CachedProvider's hit/miss counters.
+type ProviderStats struct {
+	Hits   int64 `json:"hits"`
+	Misses int64 `json:"misses"`
 }
 
 // NewCachedProvider wraps an EmbeddingProvider so that embeddings are cached in
 // the embedding_cache table of the given database. Cache keys are
 // sha256(model + "|" + text) in hex. Cached vectors are encoded/decoded using
 // memory.EncodeVector / memory.DecodeVector.
-func NewCachedProvider(inner EmbeddingProvider, db *sql.DB) EmbeddingProvider {
-	return &cachedProvider{inner: inner, db: db}
+func NewCachedProvider(inner EmbeddingProvider, db *sql.DB) *CachedProvider {
+	return &CachedProvider{inner: inner, db: db}
+}
+
+// Stats returns a snapshot of the hit/miss counters. Safe for concurrent use.
+func (c *CachedProvider) Stats() ProviderStats {
+	return ProviderStats{
+		Hits:   atomic.LoadInt64(&c.hits),
+		Misses: atomic.LoadInt64(&c.misses),
+	}
 }
 
 // contentHash computes the cache key for a text under the given model.
@@ -34,7 +57,7 @@ func contentHash(model, text string) string {
 // Embed returns embeddings for the given texts, using the cache where possible.
 // Only uncached texts are sent to the inner provider. Results are returned in
 // the same order as the input texts.
-func (c *cachedProvider) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+func (c *CachedProvider) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return [][]float32{}, nil
 	}
@@ -57,13 +80,17 @@ func (c *cachedProvider) Embed(ctx context.Context, texts []string) ([][]float32
 		return nil, fmt.Errorf("embed cache: lookup: %w", err)
 	}
 
-	// Fill in cached results and identify misses.
+	// Fill in cached results and identify misses. Each input text counts as
+	// either one hit or one miss — duplicate texts share a cache lookup but
+	// are still tallied per-input so the rate reflects request volume.
 	var missIndices []int
 	for i, h := range hashes {
 		if vec, ok := cached[h]; ok {
 			results[i] = vec
+			atomic.AddInt64(&c.hits, 1)
 		} else {
 			missIndices = append(missIndices, i)
+			atomic.AddInt64(&c.misses, 1)
 		}
 	}
 
@@ -96,7 +123,7 @@ func (c *cachedProvider) Embed(ctx context.Context, texts []string) ([][]float32
 }
 
 // lookupCached performs a single SELECT for a batch of content hashes.
-func (c *cachedProvider) lookupCached(model string, hashes []string) (map[string][]float32, error) {
+func (c *CachedProvider) lookupCached(model string, hashes []string) (map[string][]float32, error) {
 	if len(hashes) == 0 {
 		return nil, nil
 	}
@@ -138,7 +165,7 @@ func (c *cachedProvider) lookupCached(model string, hashes []string) (map[string
 
 // insertCached inserts a single embedding into the cache. Uses INSERT OR IGNORE
 // to handle concurrent inserts of the same key gracefully.
-func (c *cachedProvider) insertCached(model, hash string, vec []float32) error {
+func (c *CachedProvider) insertCached(model, hash string, vec []float32) error {
 	_, err := c.db.Exec(
 		"INSERT OR IGNORE INTO embedding_cache (content_hash, model, embedding) VALUES (?, ?, ?)",
 		hash, model, memory.EncodeVector(vec),
@@ -147,11 +174,11 @@ func (c *cachedProvider) insertCached(model, hash string, vec []float32) error {
 }
 
 // Dimensions delegates to the inner provider.
-func (c *cachedProvider) Dimensions() int {
+func (c *CachedProvider) Dimensions() int {
 	return c.inner.Dimensions()
 }
 
 // Model delegates to the inner provider.
-func (c *cachedProvider) Model() string {
+func (c *CachedProvider) Model() string {
 	return c.inner.Model()
 }

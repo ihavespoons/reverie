@@ -2474,3 +2474,126 @@ func TestSQLiteListDailyStats_RangeQuery(t *testing.T) {
 		t.Errorf("empty range len = %d, want 0", len(none))
 	}
 }
+
+// --- LastTick (Phase 5A) ---
+
+func TestSQLiteGetLastTick_FreshStoreReturnsZero(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	got, err := s.GetLastTick(ctx)
+	if err != nil {
+		t.Fatalf("GetLastTick: %v", err)
+	}
+	if !got.IsZero() {
+		t.Errorf("fresh GetLastTick = %v, want zero value", got)
+	}
+}
+
+func TestSQLiteSetLastTick_RoundTrip(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.SetLastTick(ctx, now); err != nil {
+		t.Fatalf("SetLastTick: %v", err)
+	}
+	got, err := s.GetLastTick(ctx)
+	if err != nil {
+		t.Fatalf("GetLastTick after SetLastTick: %v", err)
+	}
+	// RFC3339 format loses sub-second precision; compare against the
+	// truncated value we wrote.
+	if !got.Equal(now) {
+		t.Errorf("GetLastTick = %v, want %v", got, now)
+	}
+}
+
+// --- SupersedeLongestChain (Phase 5A) ---
+
+func TestSQLiteSupersedeLongestChain_EmptyDB(t *testing.T) {
+	s := openTestDB(t)
+	got, err := s.SupersedeLongestChain(context.Background())
+	if err != nil {
+		t.Fatalf("SupersedeLongestChain: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("SupersedeLongestChain on empty DB = %d, want 0", got)
+	}
+}
+
+func TestSQLiteSupersedeLongestChain_ThreeFactChain(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	// Insert three distinct facts bypassing any similarity-based supersede so
+	// we control the chain shape precisely. Use the raw UPDATE to create the
+	// edges A->B->C (A.superseded_by=B, B.superseded_by=C).
+	facts := testdataFacts()
+	idA, err := s.InsertFact(ctx, facts[0])
+	if err != nil {
+		t.Fatalf("insert A: %v", err)
+	}
+	idB, err := s.InsertFact(ctx, facts[1])
+	if err != nil {
+		t.Fatalf("insert B: %v", err)
+	}
+	idC, err := s.InsertFact(ctx, facts[2])
+	if err != nil {
+		t.Fatalf("insert C: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE facts SET superseded_by = ? WHERE id = ?`, idB, idA,
+	); err != nil {
+		t.Fatalf("set A.superseded_by=B: %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE facts SET superseded_by = ? WHERE id = ?`, idC, idB,
+	); err != nil {
+		t.Fatalf("set B.superseded_by=C: %v", err)
+	}
+
+	got, err := s.SupersedeLongestChain(ctx)
+	if err != nil {
+		t.Fatalf("SupersedeLongestChain: %v", err)
+	}
+	if got != 3 {
+		t.Errorf("SupersedeLongestChain for A->B->C = %d, want 3", got)
+	}
+}
+
+// --- CountSupersededFacts (Phase 5A) ---
+
+func TestSQLiteCountSupersededFacts(t *testing.T) {
+	s := openTestDB(t)
+	ctx := context.Background()
+
+	// Start with zero.
+	got, err := s.CountSupersededFacts(ctx)
+	if err != nil {
+		t.Fatalf("CountSupersededFacts empty: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("empty DB = %d, want 0", got)
+	}
+
+	facts := testdataFacts()
+	id1, _ := s.InsertFact(ctx, facts[0])
+	id2, _ := s.InsertFact(ctx, facts[1])
+	if _, err := s.InsertFact(ctx, facts[2]); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// Supersede f1 by f2 via direct UPDATE.
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE facts SET superseded_by = ? WHERE id = ?`, id2, id1,
+	); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got, err = s.CountSupersededFacts(ctx)
+	if err != nil {
+		t.Fatalf("CountSupersededFacts: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("after one supersede = %d, want 1", got)
+	}
+}

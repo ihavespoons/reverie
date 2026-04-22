@@ -2288,3 +2288,112 @@ func TestMemClearFactSuperseded_NonexistentID(t *testing.T) {
 		t.Errorf("error = %q, want to contain %q", err.Error(), "not found")
 	}
 }
+
+// --- LastTick (Phase 5A) ---
+
+func TestMemGetLastTick_FreshStoreReturnsZero(t *testing.T) {
+	s := NewMemStore()
+	got, err := s.GetLastTick(context.Background())
+	if err != nil {
+		t.Fatalf("GetLastTick: %v", err)
+	}
+	if !got.IsZero() {
+		t.Errorf("fresh GetLastTick = %v, want zero value", got)
+	}
+}
+
+func TestMemSetLastTick_RoundTrip(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	if err := s.SetLastTick(ctx, now); err != nil {
+		t.Fatalf("SetLastTick: %v", err)
+	}
+	got, err := s.GetLastTick(ctx)
+	if err != nil {
+		t.Fatalf("GetLastTick: %v", err)
+	}
+	if got.Sub(now).Abs() > time.Second {
+		t.Errorf("GetLastTick = %v, want within 1s of %v", got, now)
+	}
+}
+
+// --- SupersedeLongestChain (Phase 5A) ---
+
+func TestMemSupersedeLongestChain_EmptyStore(t *testing.T) {
+	s := NewMemStore()
+	got, err := s.SupersedeLongestChain(context.Background())
+	if err != nil {
+		t.Fatalf("SupersedeLongestChain: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("SupersedeLongestChain on empty store = %d, want 0", got)
+	}
+}
+
+func TestMemSupersedeLongestChain_ThreeFactChain(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+
+	facts := testdataFacts()
+	idA, err := s.InsertFact(ctx, facts[0])
+	if err != nil {
+		t.Fatalf("insert A: %v", err)
+	}
+	idB, err := s.InsertFact(ctx, facts[1])
+	if err != nil {
+		t.Fatalf("insert B: %v", err)
+	}
+	idC, err := s.InsertFact(ctx, facts[2])
+	if err != nil {
+		t.Fatalf("insert C: %v", err)
+	}
+	// A->B->C
+	if err := s.SupersedeFact(ctx, idA, idB); err != nil {
+		t.Fatalf("supersede A by B: %v", err)
+	}
+	if err := s.SupersedeFact(ctx, idB, idC); err != nil {
+		t.Fatalf("supersede B by C: %v", err)
+	}
+
+	got, err := s.SupersedeLongestChain(ctx)
+	if err != nil {
+		t.Fatalf("SupersedeLongestChain: %v", err)
+	}
+	if got != 3 {
+		t.Errorf("SupersedeLongestChain for A->B->C = %d, want 3", got)
+	}
+}
+
+// --- CountSupersededFacts (Phase 5A) ---
+
+func TestMemCountSupersededFacts(t *testing.T) {
+	s := NewMemStore()
+	ctx := context.Background()
+
+	got, err := s.CountSupersededFacts(ctx)
+	if err != nil {
+		t.Fatalf("CountSupersededFacts empty: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("empty = %d, want 0", got)
+	}
+
+	facts := testdataFacts()
+	id1, _ := s.InsertFact(ctx, facts[0])
+	id2, _ := s.InsertFact(ctx, facts[1])
+	if _, err := s.InsertFact(ctx, facts[2]); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := s.SupersedeFact(ctx, id1, id2); err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+	got, err = s.CountSupersededFacts(ctx)
+	if err != nil {
+		t.Fatalf("CountSupersededFacts: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("after one supersede = %d, want 1", got)
+	}
+}

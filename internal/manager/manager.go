@@ -5,6 +5,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"personal/reverie/internal/memory"
 )
@@ -124,10 +125,17 @@ func (mm *memoryManager) Reinforce(ctx context.Context, credits map[string]float
 }
 
 // TickDecay delegates to Store.TickAllClusters: increments turns_since on every
-// cluster by 1, then resets to 0 for the clusters in accessedClusterIDs.
+// cluster by 1, then resets to 0 for the clusters in accessedClusterIDs. On
+// success it records the current UTC time as the "last tick" via
+// Store.SetLastTick so reverie://status can surface when decay last ran.
+// A SetLastTick failure after a successful tick is surfaced as a wrapped
+// error; the tick itself already committed.
 func (mm *memoryManager) TickDecay(ctx context.Context, accessedClusterIDs []string) error {
 	if err := mm.store.TickAllClusters(ctx, accessedClusterIDs); err != nil {
 		return fmt.Errorf("manager: tick decay: %w", err)
+	}
+	if err := mm.store.SetLastTick(ctx, time.Now().UTC()); err != nil {
+		return fmt.Errorf("manager: tick decay: record last tick: %w", err)
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -12,6 +13,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"personal/reverie/internal/embed"
 	"personal/reverie/internal/memory"
 )
 
@@ -62,13 +64,22 @@ func (s *Server) registerResources(srv *mcpsdk.Server) {
 
 // --- reverie://status ---
 
-// statusResponse is the JSON structure for the status resource.
+// statusResponse is the JSON structure for the status resource. The original
+// fields (db_path, embedding, decay, counts, disabled) are kept in place for
+// backward compatibility; Phase 5A appends retention, supersede,
+// embedding_cache and last_tick subsections.
 type statusResponse struct {
 	DBPath    string          `json:"db_path"`
 	Embedding embeddingStatus `json:"embedding"`
 	Decay     decayStatus     `json:"decay"`
 	Counts    countStatus     `json:"counts"`
 	Disabled  bool            `json:"disabled"`
+
+	// Phase 5A additions.
+	Retention      retentionStatus `json:"retention"`
+	Supersede      supersedeStatus `json:"supersede"`
+	EmbeddingCache cacheStatus     `json:"embedding_cache"`
+	LastTick       string          `json:"last_tick,omitempty"` // ISO8601 UTC, empty when never ticked
 }
 
 type embeddingStatus struct {
@@ -88,6 +99,44 @@ type countStatus struct {
 	Clusters int `json:"clusters"`
 }
 
+// retentionStatus summarises cluster retention across the store: how many
+// clusters sit below the configured threshold and a histogram over
+// retention. Buckets sum to the number of non-empty clusters.
+type retentionStatus struct {
+	BelowThreshold int                      `json:"below_threshold"`
+	Buckets        []memory.RetentionBucket `json:"buckets"`
+}
+
+// supersedeStatus summarises the supersede graph. Degraded is set when a
+// sub-computation (e.g. the longest-chain CTE) times out per the Phase 5A
+// "status stays cheap" rule — the numeric fields may be stale or zero.
+type supersedeStatus struct {
+	TotalSuperseded int  `json:"total_superseded"`
+	LongestChain    int  `json:"longest_chain"`
+	Degraded        bool `json:"degraded,omitempty"`
+}
+
+// cacheStatus surfaces the in-memory hit/miss counters from CachedProvider.
+// When the embedder is not a *embed.CachedProvider (e.g. tests with a raw
+// stub) all fields are zero, which is still valid JSON.
+type cacheStatus struct {
+	Hits    int64   `json:"hits"`
+	Misses  int64   `json:"misses"`
+	HitRate float64 `json:"hit_rate"` // 0.0 when hits+misses == 0
+}
+
+// retentionBucketEdges defines the 6 fixed buckets for the status histogram
+// per Phase 5A: [0, 0.1), [0.1, 0.3), [0.3, 0.5), [0.5, 0.7), [0.7, 0.9),
+// [0.9, 1.001). The last edge is slightly above 1.0 so retention=1.0 lands
+// in the top bucket.
+var retentionBucketEdges = []float64{0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.001}
+
+// statusSubtaskBudget is the per-sub-computation ceiling (250ms) from the
+// Phase 5A "status stays cheap" rule. If any single section takes longer we
+// mark it degraded and fall back to conservative defaults instead of
+// blocking the whole response.
+const statusSubtaskBudget = 250 * time.Millisecond
+
 func (s *Server) handleStatusResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
 	facts, err := s.store.ListFacts(ctx, memory.ListFilter{Limit: 10000})
 	if err != nil {
@@ -100,6 +149,90 @@ func (s *Server) handleStatusResource(ctx context.Context, req *mcpsdk.ReadResou
 	clusters, err := s.store.ListClusters(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("status: list clusters: %w", err)
+	}
+
+	// --- Retention histogram over non-empty clusters. ---
+	//
+	// Computed in the handler (not in the Store) because the Decayer lives
+	// on the Server, not behind the Store interface. Only clusters with
+	// item_count > 0 are counted — mirrors handleL1IndexResource's exclusion
+	// of empty shells. Bucket edges are fixed and documented on
+	// retentionBucketEdges.
+	threshold := s.decayer.Threshold()
+	buckets := buildRetentionBuckets(retentionBucketEdges)
+	belowThreshold := 0
+	for _, c := range clusters {
+		if c.ItemCount == 0 {
+			continue
+		}
+		r := s.decayer.Retention(c)
+		if r < threshold {
+			belowThreshold++
+		}
+		idx := retentionBucketIndex(r, retentionBucketEdges)
+		if idx >= 0 {
+			buckets[idx].Count++
+		}
+	}
+
+	// --- Supersede subsection. ---
+	//
+	// Total superseded is a cheap COUNT; the recursive CTE has an internal
+	// 100ms deadline in the store, and the handler enforces an outer 250ms
+	// budget so even a slow COUNT can't block the whole endpoint. On
+	// DeadlineExceeded we return zeros and set degraded=true per spec.
+	supersede := supersedeStatus{}
+	supersedeCtx, supersedeCancel := context.WithTimeout(ctx, statusSubtaskBudget)
+	total, terr := s.store.CountSupersededFacts(supersedeCtx)
+	if terr != nil {
+		if errors.Is(terr, context.DeadlineExceeded) {
+			supersede.Degraded = true
+		} else {
+			supersedeCancel()
+			return nil, fmt.Errorf("status: count superseded: %w", terr)
+		}
+	} else {
+		supersede.TotalSuperseded = total
+	}
+	chain, cerr := s.store.SupersedeLongestChain(supersedeCtx)
+	if cerr != nil {
+		if errors.Is(cerr, context.DeadlineExceeded) {
+			supersede.Degraded = true
+		} else {
+			supersedeCancel()
+			return nil, fmt.Errorf("status: longest chain: %w", cerr)
+		}
+	} else {
+		supersede.LongestChain = chain
+	}
+	supersedeCancel()
+
+	// --- Embedding cache stats. ---
+	//
+	// Type-assertion so uncached embedders (tests, or a future non-cached
+	// provider) still produce valid zero-valued JSON. Not part of the
+	// EmbeddingProvider interface because Stats() is specific to
+	// CachedProvider and would force stubs to implement a no-op.
+	cache := cacheStatus{}
+	if cp, ok := s.embedder.(*embed.CachedProvider); ok {
+		stats := cp.Stats()
+		cache.Hits = stats.Hits
+		cache.Misses = stats.Misses
+		if denom := stats.Hits + stats.Misses; denom > 0 {
+			cache.HitRate = float64(stats.Hits) / float64(denom)
+		}
+	}
+
+	// --- Last tick. ---
+	//
+	// Empty string when the decay scheduler has never run (fresh DB or an
+	// in-memory test store that was never ticked). Caller code should treat
+	// empty as "unknown".
+	lastTickStr := ""
+	if tick, terr := s.store.GetLastTick(ctx); terr != nil {
+		return nil, fmt.Errorf("status: get last tick: %w", terr)
+	} else if !tick.IsZero() {
+		lastTickStr = tick.UTC().Format("2006-01-02T15:04:05Z")
 	}
 
 	resp := statusResponse{
@@ -118,7 +251,11 @@ func (s *Server) handleStatusResource(ctx context.Context, req *mcpsdk.ReadResou
 			Episodes: len(episodes),
 			Clusters: len(clusters),
 		},
-		Disabled: s.cfg.Server.Disabled,
+		Disabled:       s.cfg.Server.Disabled,
+		Retention:      retentionStatus{BelowThreshold: belowThreshold, Buckets: buckets},
+		Supersede:      supersede,
+		EmbeddingCache: cache,
+		LastTick:       lastTickStr,
 	}
 
 	data, err := json.Marshal(resp)
@@ -133,6 +270,38 @@ func (s *Server) handleStatusResource(ctx context.Context, req *mcpsdk.ReadResou
 			Text:     string(data),
 		}},
 	}, nil
+}
+
+// buildRetentionBuckets allocates a zero-count bucket slice from the given
+// edges. len(edges) == N means N-1 buckets, each [edges[i], edges[i+1]).
+func buildRetentionBuckets(edges []float64) []memory.RetentionBucket {
+	if len(edges) < 2 {
+		return nil
+	}
+	buckets := make([]memory.RetentionBucket, len(edges)-1)
+	for i := 0; i < len(edges)-1; i++ {
+		buckets[i] = memory.RetentionBucket{Min: edges[i], Max: edges[i+1]}
+	}
+	return buckets
+}
+
+// retentionBucketIndex returns the bucket index for retention r given the
+// edges slice, or -1 if r is out of range. Semantics: each bucket is
+// [edges[i], edges[i+1]). Edges must be strictly ascending. The last edge
+// is slightly above 1.0 (1.001) so r=1.0 lands in the top bucket.
+func retentionBucketIndex(r float64, edges []float64) int {
+	if len(edges) < 2 {
+		return -1
+	}
+	if r < edges[0] {
+		return -1
+	}
+	for i := 0; i < len(edges)-1; i++ {
+		if r < edges[i+1] {
+			return i
+		}
+	}
+	return -1
 }
 
 // --- reverie://l1/index ---
