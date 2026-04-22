@@ -333,12 +333,14 @@ func TestMigration3_Backfill(t *testing.T) {
 	saved := migrations
 	t.Cleanup(func() { migrations = saved })
 
-	// Snip migration 3 from the embedded list so we can control when it runs.
-	var mig3 migration
+	// Keep only migrations 1 and 2 during the seed phase. Migration 3
+	// (the backfill under test) and any later migrations are re-plugged
+	// after we seed facts/episodes, so the backfill sees the seed data.
+	var laterMigs []migration
 	trimmed := make([]migration, 0, len(saved))
 	for _, m := range saved {
-		if m.Version == 3 {
-			mig3 = m
+		if m.Version >= 3 {
+			laterMigs = append(laterMigs, m)
 			continue
 		}
 		trimmed = append(trimmed, m)
@@ -400,10 +402,10 @@ func TestMigration3_Backfill(t *testing.T) {
 		}
 	}
 
-	// Now plug migration 3 back in and apply it.
-	migrations = append(trimmed, mig3)
+	// Now plug migrations 3+ back in (in their original order) and apply.
+	migrations = append(append([]migration{}, trimmed...), laterMigs...)
 	if err := applyMigrations(raw); err != nil {
-		t.Fatalf("applyMigrations (mig 3): %v", err)
+		t.Fatalf("applyMigrations (mig 3+): %v", err)
 	}
 
 	// Expect: dayA has facts_in=2, episodes_in=1; dayB has facts_in=1, episodes_in=1.
@@ -468,10 +470,19 @@ func TestMigration3_Idempotent(t *testing.T) {
 	}
 	defer db2.Close()
 
-	// Version still 3 (not advanced past it; not repeated).
+	// Version 3 is present (not repeated, not rolled back by a later
+	// migration). The highest applied version advances as new migrations
+	// land, so we check for 3's presence rather than leadership.
 	got := appliedVersions(t, db2)
-	if got[len(got)-1] != 3 {
-		t.Errorf("highest applied version = %d, want 3", got[len(got)-1])
+	hasMig3 := false
+	for _, v := range got {
+		if v == 3 {
+			hasMig3 = true
+			break
+		}
+	}
+	if !hasMig3 {
+		t.Errorf("migration 3 missing from applied versions: %v", got)
 	}
 	// Probe row unchanged.
 	var factsIn, epIn int
@@ -482,6 +493,78 @@ func TestMigration3_Idempotent(t *testing.T) {
 	}
 	if factsIn != 7 || epIn != 11 {
 		t.Errorf("probe row changed: facts_in=%d episodes_in=%d, want 7/11", factsIn, epIn)
+	}
+}
+
+// TestMigration4_FreshDB exercises the schema changes made by migration 4
+// (session_metadata): the sessions table picks up project_hint / tags /
+// created_at / closed_at columns and the updated_at index is created.
+func TestMigration4_FreshDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mig4_fresh.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	wantCols := []string{"project_hint", "tags", "created_at", "closed_at"}
+	for _, col := range wantCols {
+		var found string
+		row := db.QueryRow(
+			`SELECT name FROM pragma_table_info('sessions') WHERE name = ?`, col,
+		)
+		if err := row.Scan(&found); err != nil {
+			t.Errorf("sessions.%s column missing: %v", col, err)
+		}
+	}
+
+	// Index present.
+	var idxName string
+	if err := db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_sessions_updated'`,
+	).Scan(&idxName); err != nil {
+		t.Errorf("idx_sessions_updated missing: %v", err)
+	}
+}
+
+// TestMigration4_Idempotent verifies that reopening a fully-migrated DB
+// does not re-run migration 4. We write-then-read a sessions row across
+// the reopen boundary to prove the added columns persist unchanged.
+func TestMigration4_Idempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mig4_idem.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	// Write a session with specific project_hint/tags so the idempotency
+	// check has something observable to compare.
+	if _, err := db.Exec(
+		`INSERT INTO sessions (id, turn_counter, working_memory, project_hint, tags, created_at, updated_at)
+		 VALUES ('s1', 0, '{}', 'reverie', '["go","mcp"]', datetime('now'), datetime('now'))`,
+	); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	db.Close()
+
+	// Reopen: schema_migrations already has version 4, so the migration
+	// must be a no-op and the row must round-trip unchanged.
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer db2.Close()
+
+	var projectHint, tags string
+	if err := db2.QueryRow(
+		`SELECT project_hint, tags FROM sessions WHERE id = 's1'`,
+	).Scan(&projectHint, &tags); err != nil {
+		t.Fatalf("reselect session: %v", err)
+	}
+	if projectHint != "reverie" {
+		t.Errorf("project_hint = %q, want %q", projectHint, "reverie")
+	}
+	if tags != `["go","mcp"]` {
+		t.Errorf("tags = %q, want %q", tags, `["go","mcp"]`)
 	}
 }
 

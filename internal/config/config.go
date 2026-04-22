@@ -19,6 +19,7 @@ type Config struct {
 	Embedding Embedding `toml:"embedding"`
 	Cluster   Cluster   `toml:"cluster"`
 	Server    Server    `toml:"server"`
+	Session   Session   `toml:"session"`
 }
 
 // Storage configures the SQLite database location.
@@ -75,6 +76,14 @@ type Server struct {
 	Disabled                     bool   `toml:"disabled"`
 }
 
+// Session configures per-session working memory bounds. Added in Phase 6b.
+// BufferBudgetMax caps the number of MemoryRef entries stored in a session's
+// persisted buffer; appends that would exceed it evict the lowest-scored
+// entry first.
+type Session struct {
+	BufferBudgetMax int `toml:"buffer_budget_max"`
+}
+
 // Defaults returns a fully-populated Config with sensible default values
 // matching the plan's TOML example.
 func Defaults() *Config {
@@ -112,6 +121,9 @@ func Defaults() *Config {
 			RecallCacheTTLSeconds:        300,
 			LogLevel:                     "info",
 			Disabled:                     false,
+		},
+		Session: Session{
+			BufferBudgetMax: 50,
 		},
 	}
 }

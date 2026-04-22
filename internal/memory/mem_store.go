@@ -35,6 +35,9 @@ type memStore struct {
 	// lastTick mirrors the sqlite decay_state.last_tick singleton. Zero value
 	// = never ticked.
 	lastTick time.Time
+	// sessions holds persisted session checkpoints (Phase 6b). Keyed by
+	// Session.ID; the stored value is the authoritative snapshot.
+	sessions map[string]Session
 }
 
 // NewMemStore returns a thread-safe in-memory Store.
@@ -43,6 +46,7 @@ func NewMemStore() Store {
 		facts:    make(map[string]Fact),
 		episodes: make(map[string]Episode),
 		clusters: make(map[string]ClusterNode),
+		sessions: make(map[string]Session),
 	}
 }
 
@@ -1092,6 +1096,120 @@ func (m *memStore) CountSupersededFacts(_ context.Context) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// --- Session CRUD (Phase 6b) ---
+
+func (m *memStore) GetSession(_ context.Context, id string) (*Session, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return nil, nil
+	}
+	// Return a deep-ish copy so callers mutating the returned Session can't
+	// corrupt the store. Buffer + tags slices are the observable mutability
+	// risk; clone them.
+	out := s
+	if s.Tags != nil {
+		out.Tags = append([]string{}, s.Tags...)
+	}
+	if s.WorkingMem.Buffer != nil {
+		out.WorkingMem.Buffer = append([]MemoryRef{}, s.WorkingMem.Buffer...)
+	}
+	if s.ClosedAt != nil {
+		closed := *s.ClosedAt
+		out.ClosedAt = &closed
+	}
+	return &out, nil
+}
+
+func (m *memStore) CreateSession(_ context.Context, s Session) error {
+	if s.ID == "" {
+		return fmt.Errorf("mem store: create session: id is required")
+	}
+	normTags, err := normalizeTags(s.Tags)
+	if err != nil {
+		return fmt.Errorf("mem store: create session: %w", err)
+	}
+	s.Tags = normTags
+
+	now := time.Now().UTC()
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = now
+	}
+	if s.UpdatedAt.IsZero() {
+		s.UpdatedAt = now
+	}
+	if s.WorkingMem.Buffer == nil {
+		s.WorkingMem.Buffer = []MemoryRef{}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.sessions[s.ID]; exists {
+		return fmt.Errorf("mem store: create session: session already exists: %s", s.ID)
+	}
+	m.sessions[s.ID] = s
+	return nil
+}
+
+func (m *memStore) UpdateSessionBuffer(_ context.Context, id string, wm WorkingMemory) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return fmt.Errorf("mem store: update session buffer: session %q not found", id)
+	}
+	// Persist only buffer + budget per the Phase 6a ownership split; other
+	// fields (Clusters/InteractionCtx/TaskMeta) are ignored even if the
+	// caller supplied them.
+	s.WorkingMem = WorkingMemory{
+		Buffer:     append([]MemoryRef{}, wm.Buffer...),
+		BudgetUsed: wm.BudgetUsed,
+		BudgetMax:  wm.BudgetMax,
+	}
+	if s.WorkingMem.Buffer == nil {
+		s.WorkingMem.Buffer = []MemoryRef{}
+	}
+	s.UpdatedAt = time.Now().UTC()
+	m.sessions[id] = s
+	return nil
+}
+
+func (m *memStore) UpdateSessionMeta(_ context.Context, id string, projectHint string, tags []string) error {
+	normTags, err := normalizeTags(tags)
+	if err != nil {
+		return fmt.Errorf("mem store: update session meta: %w", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return fmt.Errorf("mem store: update session meta: session %q not found", id)
+	}
+	s.ProjectHint = projectHint
+	s.Tags = normTags
+	s.UpdatedAt = time.Now().UTC()
+	m.sessions[id] = s
+	return nil
+}
+
+func (m *memStore) CloseSession(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return fmt.Errorf("mem store: close session: session %q not found", id)
+	}
+	if s.ClosedAt != nil {
+		return nil // idempotent
+	}
+	now := time.Now().UTC()
+	s.ClosedAt = &now
+	s.UpdatedAt = now
+	m.sessions[id] = s
+	return nil
 }
 
 func (m *memStore) Close() error {

@@ -258,6 +258,33 @@ type Store interface {
 	// superseded population.
 	CountSupersededFacts(ctx context.Context) (int, error)
 
+	// --- Session CRUD (Phase 6b) ---
+
+	// GetSession returns the session by id, or (nil, nil) if not found.
+	GetSession(ctx context.Context, id string) (*Session, error)
+
+	// CreateSession inserts a new session row. Returns an error if a session
+	// with the same id already exists. Implementations normalize tags with
+	// the same normalizeTags helper used by facts/episodes.
+	CreateSession(ctx context.Context, s Session) error
+
+	// UpdateSessionBuffer serializes the session's WorkingMemory (buffer +
+	// budget only — clusters/interaction/taskmeta are ignored per the
+	// Phase 6a ownership split) to the working_memory column and bumps
+	// updated_at. Returns an error if the session does not exist.
+	UpdateSessionBuffer(ctx context.Context, id string, wm WorkingMemory) error
+
+	// UpdateSessionMeta replaces the project_hint and tags fields for the
+	// session. Implementations normalize tags via normalizeTags. Returns an
+	// error if the session does not exist.
+	UpdateSessionMeta(ctx context.Context, id string, projectHint string, tags []string) error
+
+	// CloseSession sets closed_at to the current time on the session.
+	// Calling CloseSession on an already-closed session is a no-op (returns
+	// nil) — idempotency matches the rest of the store's delete/close
+	// conventions. Returns an error if the session does not exist.
+	CloseSession(ctx context.Context, id string) error
+
 	// Close releases any resources held by the store (e.g., database connections).
 	Close() error
 }

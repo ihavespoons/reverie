@@ -117,6 +117,22 @@ SELECT date(created_at), COUNT(*) FROM episodes
 GROUP BY date(created_at)
 ON CONFLICT(date) DO UPDATE SET episodes_in = episodes_in + excluded.episodes_in;`,
 	},
+	{
+		Version: 4,
+		Name:    "session_metadata",
+		// Extends the sessions table with the fields required by Phase 6:
+		// project_hint / tags for TaskMeta round-trips, created_at so the
+		// resource can surface a start time, and closed_at so closed sessions
+		// can be detected without a side table. ALTER TABLE ADD COLUMN is
+		// safe on existing rows (they pick up the defaults), and SQLite's
+		// NULL default for closed_at is exactly the "open session" sentinel
+		// the rest of the code relies on.
+		SQL: `ALTER TABLE sessions ADD COLUMN project_hint TEXT DEFAULT '';
+ALTER TABLE sessions ADD COLUMN tags TEXT DEFAULT '[]';
+ALTER TABLE sessions ADD COLUMN created_at TEXT DEFAULT (datetime('now'));
+ALTER TABLE sessions ADD COLUMN closed_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);`,
+	},
 }
 
 // applyMigrations ensures the schema_migrations bookkeeping table exists and

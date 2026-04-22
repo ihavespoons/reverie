@@ -35,6 +35,7 @@ type RecallInput struct {
 	Subtype   string   `json:"subtype,omitempty" jsonschema:"restrict to this fact subtype"`
 	Layer     string   `json:"layer,omitempty" jsonschema:"l2, l3, or both (default)"`
 	TagsAny   []string `json:"tags_any,omitempty" jsonschema:"restrict to memories with any of these tags"`
+	SessionID string   `json:"session_id,omitempty" jsonschema:"attach this call to a session; buffer updates on recall/write/reinforce"`
 }
 
 // RecallCandidate is a single candidate in the recall result.
@@ -119,6 +120,10 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		Candidates: make([]RecallCandidate, len(candidates)),
 	}
 
+	// Parallel slice of per-candidate retention values so the session buffer
+	// update below can reuse the recall scoring without re-fetching clusters.
+	candidateRetentions := make([]float64, len(candidates))
+
 	for i, c := range candidates {
 		var retention float64
 		var gateCPass bool
@@ -132,6 +137,7 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 			retention = s.decayer.Retention(*cl)
 			gateCPass = s.decayer.GateC(*cl)
 		}
+		candidateRetentions[i] = retention
 		// If cluster not found (shouldn't happen): retention=0, gate_c_pass=false.
 
 		rc := RecallCandidate{
@@ -185,7 +191,19 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		createdAt:  time.Now(),
 	})
 
-	s.logger.Info("memory_recall", "recall_id", out.RecallID, "candidates", len(out.Candidates), "round", in.Round)
+	// Session buffer update: append each returned candidate with the
+	// composite score. Unknown or closed session_id errors; snapshot
+	// failures are swallowed (the recall itself already succeeded).
+	budgetMax := s.bufferBudgetMax()
+	if err := s.applySessionMutation(ctx, in.SessionID, func(wm *memory.WorkingMemory) {
+		for i, c := range candidates {
+			memory.AppendToBuffer(wm, recallBufferEntry(c, candidateRetentions[i]), budgetMax)
+		}
+	}); err != nil {
+		return nil, RecallOutput{}, err
+	}
+
+	s.logger.Info("memory_recall", "recall_id", out.RecallID, "candidates", len(out.Candidates), "round", in.Round, "session_id", in.SessionID)
 	return nil, out, nil
 }
 
@@ -292,6 +310,7 @@ type WriteInput struct {
 	Confidence *float64        `json:"confidence,omitempty" jsonschema:"Confidence in [0,1]; defaults to 1.0. Facts only — rejected for episodes."`
 	Episode    *EpisodePayload `json:"episode,omitempty" jsonschema:"if set, writes an L3 episode instead of an L2 fact"`
 	DryRun     bool            `json:"dry_run,omitempty" jsonschema:"if true, preview cluster assignment and supersede candidate without writing"`
+	SessionID  string          `json:"session_id,omitempty" jsonschema:"attach this call to a session; buffer updates on recall/write/reinforce"`
 }
 
 // WriteOutput is the output schema for the memory_write tool.
@@ -430,7 +449,12 @@ func (s *Server) writeEpisode(ctx context.Context, in WriteInput) (*mcpsdk.CallT
 		s.logger.Warn("memory_write: tick decay (episode) failed", "err", tickErr)
 	}
 
-	s.logger.Info("memory_write", "id", id, "layer", "l3_episodic", "cluster_id", clusterID, "is_new_cluster", isNew)
+	// Session buffer update: append the new memory ID with score 1.0.
+	if err := s.appendWriteToSessionBuffer(ctx, in.SessionID, id, memory.TypeL3Episodic, embedText); err != nil {
+		return nil, WriteOutput{}, err
+	}
+
+	s.logger.Info("memory_write", "id", id, "layer", "l3_episodic", "cluster_id", clusterID, "is_new_cluster", isNew, "session_id", in.SessionID)
 	return nil, WriteOutput{ID: id, Layer: string(memory.TypeL3Episodic)}, nil
 }
 
@@ -548,7 +572,12 @@ func (s *Server) writeFact(ctx context.Context, in WriteInput) (*mcpsdk.CallTool
 		s.logger.Warn("memory_write: tick decay (fact) failed", "err", tickErr)
 	}
 
-	s.logger.Info("memory_write", "id", id, "subtype", in.Type, "content_len", len(in.Content), "cluster_id", clusterID, "is_new_cluster", isNew)
+	// Session buffer update: append the new memory ID with score 1.0.
+	if err := s.appendWriteToSessionBuffer(ctx, in.SessionID, id, memory.TypeL2Semantic, in.Content); err != nil {
+		return nil, WriteOutput{}, err
+	}
+
+	s.logger.Info("memory_write", "id", id, "subtype", in.Type, "content_len", len(in.Content), "cluster_id", clusterID, "is_new_cluster", isNew, "session_id", in.SessionID)
 	return nil, WriteOutput{ID: id, Layer: string(memory.TypeL2Semantic)}, nil
 }
 
@@ -557,6 +586,7 @@ func (s *Server) writeFact(ctx context.Context, in WriteInput) (*mcpsdk.CallTool
 // ReinforceInput is the input schema for the memory_reinforce tool.
 type ReinforceInput struct {
 	MemoryIDs []string `json:"memory_ids" jsonschema:"IDs of memories to reinforce"`
+	SessionID string   `json:"session_id,omitempty" jsonschema:"attach this call to a session; buffer updates on recall/write/reinforce"`
 }
 
 // ReinforceOutput is the output schema for the memory_reinforce tool.
@@ -591,7 +621,31 @@ func (s *Server) handleReinforce(ctx context.Context, _ *mcpsdk.CallToolRequest,
 		return nil, ReinforceOutput{}, fmt.Errorf("touch accessed: %w", err)
 	}
 
-	s.logger.Info("memory_reinforce", "count", len(in.MemoryIDs))
+	// Session buffer update: bump the score of any buffer entries whose ID
+	// was reinforced. We use a simple capped +0.1 bump (see
+	// reinforceNewScore); re-recalling the underlying retention here would
+	// require re-fetching each memory + its cluster, which is out of scope
+	// for a reinforce call.
+	if err := s.applySessionMutation(ctx, in.SessionID, func(wm *memory.WorkingMemory) {
+		if len(wm.Buffer) == 0 {
+			return
+		}
+		updates := make(map[string]float64, len(in.MemoryIDs))
+		reinforceSet := make(map[string]struct{}, len(in.MemoryIDs))
+		for _, id := range in.MemoryIDs {
+			reinforceSet[id] = struct{}{}
+		}
+		for _, ref := range wm.Buffer {
+			if _, ok := reinforceSet[ref.ID]; ok {
+				updates[ref.ID] = reinforceNewScore(ref.Score)
+			}
+		}
+		memory.RescoreBuffer(wm, updates)
+	}); err != nil {
+		return nil, ReinforceOutput{}, err
+	}
+
+	s.logger.Info("memory_reinforce", "count", len(in.MemoryIDs), "session_id", in.SessionID)
 	return nil, ReinforceOutput{Reinforced: len(in.MemoryIDs)}, nil
 }
 
@@ -864,8 +918,9 @@ type Verdict struct {
 
 // ApplyJudgmentInput is the input schema for the memory_apply_judgment tool.
 type ApplyJudgmentInput struct {
-	RecallID string    `json:"recall_id" jsonschema:"the recall_id returned by memory_recall"`
-	Verdicts []Verdict `json:"verdicts" jsonschema:"per-candidate keep/drop verdicts from the memory-judge subagent"`
+	RecallID  string    `json:"recall_id" jsonschema:"the recall_id returned by memory_recall"`
+	Verdicts  []Verdict `json:"verdicts" jsonschema:"per-candidate keep/drop verdicts from the memory-judge subagent"`
+	SessionID string    `json:"session_id,omitempty" jsonschema:"attach this call to a session; buffer updates on recall/write/reinforce"`
 }
 
 // MemoryRefResp is a memory reference in the apply judgment output, without embeddings.
@@ -1005,7 +1060,20 @@ func (s *Server) handleApplyJudgment(ctx context.Context, _ *mcpsdk.CallToolRequ
 		memories[i] = ref
 	}
 
-	s.logger.Info("memory_apply_judgment", "recall_id", in.RecallID, "round", cached.round, "logic", logic, "passed", len(memories))
+	// Session buffer update: replace the buffer entries for this recall
+	// with the filtered (kept) set so rejected candidates no longer occupy
+	// budget.
+	if err := s.applySessionMutation(ctx, in.SessionID, func(wm *memory.WorkingMemory) {
+		keepIDs := make([]string, len(memories))
+		for i, m := range memories {
+			keepIDs[i] = m.ID
+		}
+		memory.ReplaceBufferFiltered(wm, keepIDs)
+	}); err != nil {
+		return nil, ApplyJudgmentOutput{}, err
+	}
+
+	s.logger.Info("memory_apply_judgment", "recall_id", in.RecallID, "round", cached.round, "logic", logic, "passed", len(memories), "session_id", in.SessionID)
 	return nil, ApplyJudgmentOutput{Memories: memories, AppliedLogic: logic}, nil
 }
 

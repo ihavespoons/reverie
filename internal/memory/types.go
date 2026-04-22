@@ -218,6 +218,24 @@ func (c Candidate) AccessedAt() time.Time {
 	return time.Time{}
 }
 
+// Session is the persisted working-memory checkpoint for a named session.
+// ID is the client-generated identifier; ProjectHint and Tags mirror the
+// TaskMeta fields; WorkingMem carries the buffer + budget metadata (the
+// JSON blob persisted to sessions.working_memory only includes buffer +
+// budget — cluster/interaction/task metadata is owned elsewhere per the
+// Phase 6a ownership split). ClosedAt is nil for active sessions; once set,
+// the session is read-only and subsequent tool calls using this SessionID
+// must error.
+type Session struct {
+	ID          string        `json:"id"`
+	ProjectHint string        `json:"project_hint"`
+	Tags        []string      `json:"tags"`
+	WorkingMem  WorkingMemory `json:"working_mem"`
+	CreatedAt   time.Time     `json:"created_at"`
+	UpdatedAt   time.Time     `json:"updated_at"`
+	ClosedAt    *time.Time    `json:"closed_at,omitempty"`
+}
+
 // EpisodeLink describes a cross-type link from a fact to an episode.
 type EpisodeLink struct {
 	EpisodeID string   `json:"episode_id"`

@@ -1454,6 +1454,181 @@ func (s *sqliteStore) CountSupersededFacts(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// --- Session CRUD (Phase 6b) ---
+
+func (s *sqliteStore) GetSession(ctx context.Context, id string) (*Session, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, project_hint, tags, working_memory, created_at, updated_at, closed_at
+		 FROM sessions WHERE id = ?`, id,
+	)
+
+	var sess Session
+	var projectHint, wmRaw, tagsRaw, createdStr, updatedStr string
+	var closedAt sql.NullString
+	if err := row.Scan(&sess.ID, &projectHint, &tagsRaw, &wmRaw, &createdStr, &updatedStr, &closedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("sqlite store: get session: %w", err)
+	}
+	sess.ProjectHint = projectHint
+
+	tags, err := decodeTags(tagsRaw)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite store: get session: %w", err)
+	}
+	sess.Tags = tags
+
+	wm, err := decodeWorkingMemory(wmRaw)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite store: get session: %w", err)
+	}
+	sess.WorkingMem = wm
+
+	sess.CreatedAt, _ = time.Parse(timeFormat, createdStr)
+	// updated_at is stored as datetime('now') in SQLite's "YYYY-MM-DD HH:MM:SS"
+	// format by the default; try that first, then RFC3339 for rows written
+	// by the Go layer.
+	if t, perr := time.Parse(timeFormat, updatedStr); perr == nil {
+		sess.UpdatedAt = t
+	} else if t2, perr2 := time.Parse("2006-01-02 15:04:05", updatedStr); perr2 == nil {
+		sess.UpdatedAt = t2.UTC()
+	}
+	if closedAt.Valid && closedAt.String != "" {
+		var ct time.Time
+		if t, perr := time.Parse(timeFormat, closedAt.String); perr == nil {
+			ct = t
+		} else if t2, perr2 := time.Parse("2006-01-02 15:04:05", closedAt.String); perr2 == nil {
+			ct = t2.UTC()
+		}
+		if !ct.IsZero() {
+			sess.ClosedAt = &ct
+		}
+	}
+
+	return &sess, nil
+}
+
+func (s *sqliteStore) CreateSession(ctx context.Context, sess Session) error {
+	if sess.ID == "" {
+		return fmt.Errorf("sqlite store: create session: id is required")
+	}
+	normTags, err := normalizeTags(sess.Tags)
+	if err != nil {
+		return fmt.Errorf("sqlite store: create session: %w", err)
+	}
+	tagsJSON, err := encodeTags(normTags)
+	if err != nil {
+		return fmt.Errorf("sqlite store: create session: %w", err)
+	}
+	wmJSON, err := encodeWorkingMemory(sess.WorkingMem)
+	if err != nil {
+		return fmt.Errorf("sqlite store: create session: %w", err)
+	}
+
+	now := time.Now().UTC()
+	if sess.CreatedAt.IsZero() {
+		sess.CreatedAt = now
+	}
+	if sess.UpdatedAt.IsZero() {
+		sess.UpdatedAt = now
+	}
+
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO sessions (id, turn_counter, working_memory, project_hint, tags, created_at, updated_at, closed_at)
+		 VALUES (?, 0, ?, ?, ?, ?, ?, NULL)`,
+		sess.ID, wmJSON, sess.ProjectHint, tagsJSON,
+		sess.CreatedAt.Format(timeFormat),
+		sess.UpdatedAt.Format(timeFormat),
+	)
+	if err != nil {
+		// SQLite raises a unique constraint error for duplicate primary
+		// keys; surface that as a stable error message so callers can key
+		// off it without importing the driver package.
+		if strings.Contains(err.Error(), "UNIQUE") || strings.Contains(err.Error(), "constraint") {
+			return fmt.Errorf("sqlite store: create session: session already exists: %s", sess.ID)
+		}
+		return fmt.Errorf("sqlite store: create session: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) UpdateSessionBuffer(ctx context.Context, id string, wm WorkingMemory) error {
+	wmJSON, err := encodeWorkingMemory(wm)
+	if err != nil {
+		return fmt.Errorf("sqlite store: update session buffer: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET working_memory = ?, updated_at = ? WHERE id = ?`,
+		wmJSON, time.Now().UTC().Format(timeFormat), id,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite store: update session buffer: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite store: update session buffer: rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("sqlite store: update session buffer: session %q not found", id)
+	}
+	return nil
+}
+
+func (s *sqliteStore) UpdateSessionMeta(ctx context.Context, id string, projectHint string, tags []string) error {
+	normTags, err := normalizeTags(tags)
+	if err != nil {
+		return fmt.Errorf("sqlite store: update session meta: %w", err)
+	}
+	tagsJSON, err := encodeTags(normTags)
+	if err != nil {
+		return fmt.Errorf("sqlite store: update session meta: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET project_hint = ?, tags = ?, updated_at = ? WHERE id = ?`,
+		projectHint, tagsJSON, time.Now().UTC().Format(timeFormat), id,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite store: update session meta: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlite store: update session meta: rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("sqlite store: update session meta: session %q not found", id)
+	}
+	return nil
+}
+
+func (s *sqliteStore) CloseSession(ctx context.Context, id string) error {
+	// Look up to distinguish not-found from already-closed: the former is
+	// an error (protects callers from typos), the latter is idempotent.
+	var closedAt sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT closed_at FROM sessions WHERE id = ?`, id,
+	).Scan(&closedAt)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("sqlite store: close session: session %q not found", id)
+	}
+	if err != nil {
+		return fmt.Errorf("sqlite store: close session: %w", err)
+	}
+	if closedAt.Valid && closedAt.String != "" {
+		return nil // already closed — idempotent
+	}
+
+	now := time.Now().UTC().Format(timeFormat)
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE sessions SET closed_at = ?, updated_at = ? WHERE id = ?`,
+		now, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite store: close session: %w", err)
+	}
+	return nil
+}
+
 func (s *sqliteStore) Close() error {
 	return s.db.Close()
 }
