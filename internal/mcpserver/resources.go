@@ -46,6 +46,13 @@ func (s *Server) registerResources(srv *mcpsdk.Server) {
 	}, s.handleL1ClusterDetailResource)
 
 	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+		URITemplate: "reverie://l1/at_risk{?threshold,limit}",
+		Name:        "L1 At-Risk Clusters",
+		Description: "Clusters with Ebbinghaus retention below a threshold, most-at-risk first (retention ascending). Use to surface memory that is decaying and may be forgotten. Query params: threshold (float in [0,1], default = configured decay.retention_threshold); limit (default 50, max 500).",
+		MIMEType:    "application/json",
+	}, s.handleL1AtRiskResource)
+
+	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
 		URITemplate: "reverie://stats/daily{?from,to}",
 		Name:        "Daily Activity Stats",
 		Description: "Per-day counters for facts in/out, episodes in/out, and supersedes, maintained by DB triggers. Dates are UTC YYYY-MM-DD. Defaults: from = today-30 days, to = today. Gaps are zero-filled. Max span 365 days.",
@@ -378,6 +385,132 @@ func (s *Server) handleL1ClusterDetailResource(ctx context.Context, req *mcpsdk.
 	data, err := json.Marshal(resp)
 	if err != nil {
 		return nil, fmt.Errorf("l1 cluster detail: marshal: %w", err)
+	}
+	return &mcpsdk.ReadResourceResult{
+		Contents: []*mcpsdk.ResourceContents{{
+			URI:      req.Params.URI,
+			MIMEType: "application/json",
+			Text:     string(data),
+		}},
+	}, nil
+}
+
+// --- reverie://l1/at_risk ---
+
+const (
+	atRiskDefaultLimit = 50
+	atRiskMaxLimit     = 500
+)
+
+// l1AtRiskResponse is the JSON structure for the at-risk resource. Clusters
+// are sorted by retention ascending (most-at-risk first), with ties broken by
+// cluster ID for determinism. Total reports the full pre-limit count so
+// callers can tell whether pagination truncated the list.
+type l1AtRiskResponse struct {
+	Threshold float64          `json:"threshold"`
+	Clusters  []l1ClusterEntry `json:"clusters"` // ascending by Retention
+	Total     int              `json:"total"`    // total non-empty clusters with retention < threshold
+}
+
+// parseAtRiskURI extracts the optional threshold (float in [0,1]) and limit
+// (int, capped at atRiskMaxLimit) from a reverie://l1/at_risk[?threshold&limit]
+// URI. When a query param is absent the corresponding `*Set` return is false
+// and the caller supplies the default.
+func parseAtRiskURI(raw string) (threshold float64, thresholdSet bool, limit int, limitSet bool, err error) {
+	u, perr := url.Parse(raw)
+	if perr != nil {
+		return 0, false, 0, false, fmt.Errorf("invalid uri: %w", perr)
+	}
+	q := u.Query()
+
+	if s := q.Get("threshold"); s != "" {
+		v, perr := strconv.ParseFloat(s, 64)
+		if perr != nil {
+			return 0, false, 0, false, fmt.Errorf("invalid threshold: %q", s)
+		}
+		if v < 0 || v > 1 {
+			return 0, false, 0, false, fmt.Errorf("threshold %g out of range [0, 1]", v)
+		}
+		threshold = v
+		thresholdSet = true
+	}
+
+	if s := q.Get("limit"); s != "" {
+		v, perr := strconv.Atoi(s)
+		if perr != nil || v < 0 {
+			return 0, false, 0, false, fmt.Errorf("invalid limit: %q", s)
+		}
+		limit = v
+		limitSet = true
+	}
+
+	return threshold, thresholdSet, limit, limitSet, nil
+}
+
+func (s *Server) handleL1AtRiskResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
+	threshold, thresholdSet, limit, limitSet, err := parseAtRiskURI(req.Params.URI)
+	if err != nil {
+		return nil, fmt.Errorf("l1 at_risk: %w", err)
+	}
+	if !thresholdSet {
+		threshold = s.decayer.Threshold()
+	}
+	if !limitSet {
+		limit = atRiskDefaultLimit
+	}
+	if limit > atRiskMaxLimit {
+		limit = atRiskMaxLimit
+	}
+
+	clusters, err := s.store.ListClusters(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("l1 at_risk: list clusters: %w", err)
+	}
+
+	entries := make([]l1ClusterEntry, 0, len(clusters))
+	for _, c := range clusters {
+		if c.ItemCount == 0 {
+			continue
+		}
+		retention := s.decayer.Retention(c)
+		if retention >= threshold {
+			continue
+		}
+		entries = append(entries, l1ClusterEntry{
+			ID:         c.ID,
+			Summary:    c.Summary,
+			Domain:     c.Domain,
+			MetaInstr:  c.MetaInstr,
+			ItemCount:  c.ItemCount,
+			Utility:    c.Utility,
+			Frequency:  c.Frequency,
+			TurnsSince: c.TurnsSince,
+			Retention:  retention,
+		})
+	}
+
+	// Most at-risk first. Break ties by id so the output is deterministic
+	// across stores (map iteration order in memStore is nondeterministic).
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Retention != entries[j].Retention {
+			return entries[i].Retention < entries[j].Retention
+		}
+		return entries[i].ID < entries[j].ID
+	})
+
+	total := len(entries)
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+
+	resp := l1AtRiskResponse{
+		Threshold: threshold,
+		Clusters:  entries,
+		Total:     total,
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return nil, fmt.Errorf("l1 at_risk: marshal: %w", err)
 	}
 	return &mcpsdk.ReadResourceResult{
 		Contents: []*mcpsdk.ResourceContents{{

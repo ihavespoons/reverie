@@ -605,6 +605,243 @@ func TestStatsDaily_EmptyStoreZeroesNotError(t *testing.T) {
 	}
 }
 
+// --- reverie://l1/at_risk tests (Phase 5B) ---
+
+// readAtRisk issues a ReadResource against the at_risk handler and parses
+// the JSON response. Protocol / JSON errors fail the test.
+func readAtRisk(t *testing.T, s *Server, uri string) l1AtRiskResponse {
+	t.Helper()
+	req := &mcpsdk.ReadResourceRequest{}
+	req.Params = &mcpsdk.ReadResourceParams{URI: uri}
+	result, err := s.handleL1AtRiskResource(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleL1AtRiskResource(%q): %v", uri, err)
+	}
+	if len(result.Contents) != 1 {
+		t.Fatalf("expected 1 content, got %d", len(result.Contents))
+	}
+	var resp l1AtRiskResponse
+	if err := json.Unmarshal([]byte(result.Contents[0].Text), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return resp
+}
+
+// seedAtRiskCluster creates a single non-empty cluster (ItemCount=1) with the
+// given id and sets its utility/frequency/turns_since so the decayer returns
+// a controllable retention. The test server uses a standard Decayer with
+// temperature=10 and threshold=0.3; with U=F=0.5 the stability is ~10.1, so
+// retention falls off exp(-n/10.1).
+func seedAtRiskCluster(t *testing.T, s *Server, id string, turnsSince int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.store.CreateCluster(ctx, memory.ClusterNode{
+		ID:        id,
+		Summary:   "at-risk " + id,
+		Domain:    "test",
+		ItemCount: 1,
+	}); err != nil {
+		t.Fatalf("CreateCluster(%s): %v", id, err)
+	}
+	// UpdateClusterState is the shortest path to a known turns_since without
+	// threading writes + decay ticks through the manager.
+	if err := s.store.UpdateClusterState(ctx, id, 0.5, 0.5, turnsSince); err != nil {
+		t.Fatalf("UpdateClusterState(%s): %v", id, err)
+	}
+}
+
+func TestL1AtRisk_OrdersAscendingByRetention(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	// Retention uses strict < threshold, and R=exp(0)=1.0 at turns_since=0.
+	// Use turns_since=1 for the "fresh" case so R<1 and it qualifies under
+	// threshold=1.0, keeping three distinct ordered retention values.
+	// turns_since 1 -> R~0.906, 10 -> ~0.37, 100 -> ~5e-5.
+	seedAtRiskCluster(t, s, "c-fresh", 1)
+	seedAtRiskCluster(t, s, "c-mid", 10)
+	seedAtRiskCluster(t, s, "c-stale", 100)
+
+	// threshold=1.0 includes everything (since R<1 for turns_since>=1).
+	resp := readAtRisk(t, s, "reverie://l1/at_risk?threshold=1.0")
+	if resp.Threshold != 1.0 {
+		t.Errorf("Threshold = %g, want 1.0", resp.Threshold)
+	}
+	if len(resp.Clusters) != 3 || resp.Total != 3 {
+		t.Fatalf("len/total = %d/%d, want 3/3", len(resp.Clusters), resp.Total)
+	}
+	wantOrder := []string{"c-stale", "c-mid", "c-fresh"}
+	for i, id := range wantOrder {
+		if resp.Clusters[i].ID != id {
+			t.Errorf("Clusters[%d].ID = %q, want %q (retention order)", i, resp.Clusters[i].ID, id)
+		}
+	}
+	for i := 1; i < len(resp.Clusters); i++ {
+		if resp.Clusters[i].Retention < resp.Clusters[i-1].Retention {
+			t.Errorf("retention not ascending: %v", resp.Clusters)
+		}
+	}
+}
+
+func TestL1AtRisk_DefaultThresholdFromConfig(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	// Default threshold is 0.3. With U=F=0.5,T=10 (stability ~10.1):
+	//   turns_since=0 -> R=1.0 (above, excluded)
+	//   turns_since=100 -> R~5e-5 (below, included)
+	seedAtRiskCluster(t, s, "c-above", 0)
+	seedAtRiskCluster(t, s, "c-below", 100)
+
+	resp := readAtRisk(t, s, "reverie://l1/at_risk")
+	if resp.Threshold != s.decayer.Threshold() {
+		t.Errorf("Threshold = %g, want %g (config default)", resp.Threshold, s.decayer.Threshold())
+	}
+	if len(resp.Clusters) != 1 || resp.Total != 1 {
+		t.Fatalf("len/total = %d/%d, want 1/1 (only c-below)", len(resp.Clusters), resp.Total)
+	}
+	if resp.Clusters[0].ID != "c-below" {
+		t.Errorf("Clusters[0].ID = %q, want c-below", resp.Clusters[0].ID)
+	}
+}
+
+func TestL1AtRisk_ExplicitThresholdOverride(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	// With threshold=0.5 the "mid" cluster (R~0.37) is in; the fresh cluster
+	// (R=1.0) is out. This proves the query param takes precedence over the
+	// default 0.3 (which would ALSO exclude the mid cluster).
+	seedAtRiskCluster(t, s, "c-fresh", 0)
+	seedAtRiskCluster(t, s, "c-mid", 10)
+	seedAtRiskCluster(t, s, "c-stale", 100)
+
+	resp := readAtRisk(t, s, "reverie://l1/at_risk?threshold=0.5")
+	if resp.Threshold != 0.5 {
+		t.Errorf("Threshold = %g, want 0.5", resp.Threshold)
+	}
+	if len(resp.Clusters) != 2 || resp.Total != 2 {
+		t.Fatalf("len/total = %d/%d, want 2/2", len(resp.Clusters), resp.Total)
+	}
+	// Most at-risk first.
+	if resp.Clusters[0].ID != "c-stale" || resp.Clusters[1].ID != "c-mid" {
+		t.Errorf("order = [%s %s], want [c-stale c-mid]", resp.Clusters[0].ID, resp.Clusters[1].ID)
+	}
+}
+
+func TestL1AtRisk_ThresholdOneIncludesAllNonEmpty(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	// See TestL1AtRisk_OrdersAscendingByRetention — turns_since must be >=1
+	// so R<1 and the cluster qualifies under threshold=1.0.
+	seedAtRiskCluster(t, s, "c-fresh", 1)
+	seedAtRiskCluster(t, s, "c-mid", 10)
+
+	// Empty cluster must be excluded regardless of threshold.
+	if err := s.store.CreateCluster(context.Background(), memory.ClusterNode{
+		ID: "c-empty", Summary: "empty",
+	}); err != nil {
+		t.Fatalf("CreateCluster(empty): %v", err)
+	}
+
+	resp := readAtRisk(t, s, "reverie://l1/at_risk?threshold=1.0")
+	if len(resp.Clusters) != 2 || resp.Total != 2 {
+		t.Fatalf("len/total = %d/%d, want 2/2 (non-empty only)", len(resp.Clusters), resp.Total)
+	}
+	for _, c := range resp.Clusters {
+		if c.ID == "c-empty" {
+			t.Errorf("empty cluster %q should be excluded", c.ID)
+		}
+	}
+}
+
+func TestL1AtRisk_LimitCapsResultsTotalReportsFull(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	// 10 clusters, all deeply at-risk. limit=3 must yield 3 entries while
+	// Total reflects the full matching count.
+	for i := 0; i < 10; i++ {
+		seedAtRiskCluster(t, s, fmt.Sprintf("c-%02d", i), 1000)
+	}
+
+	resp := readAtRisk(t, s, "reverie://l1/at_risk?limit=3")
+	if len(resp.Clusters) != 3 {
+		t.Errorf("len(Clusters) = %d, want 3 (limit)", len(resp.Clusters))
+	}
+	if resp.Total != 10 {
+		t.Errorf("Total = %d, want 10 (pre-limit)", resp.Total)
+	}
+}
+
+func TestL1AtRisk_LimitHardCapAt500(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	// 501 at-risk clusters; limit=999 should be clamped to 500.
+	for i := 0; i < 501; i++ {
+		seedAtRiskCluster(t, s, fmt.Sprintf("c-%04d", i), 1000)
+	}
+
+	resp := readAtRisk(t, s, "reverie://l1/at_risk?limit=999")
+	if len(resp.Clusters) != 500 {
+		t.Errorf("len(Clusters) = %d, want 500 (hard cap)", len(resp.Clusters))
+	}
+	if resp.Total != 501 {
+		t.Errorf("Total = %d, want 501", resp.Total)
+	}
+}
+
+func TestL1AtRisk_EmptyStore(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	resp := readAtRisk(t, s, "reverie://l1/at_risk")
+	if resp.Threshold != s.decayer.Threshold() {
+		t.Errorf("Threshold = %g, want %g", resp.Threshold, s.decayer.Threshold())
+	}
+	if len(resp.Clusters) != 0 {
+		t.Errorf("len(Clusters) = %d, want 0", len(resp.Clusters))
+	}
+	if resp.Total != 0 {
+		t.Errorf("Total = %d, want 0", resp.Total)
+	}
+}
+
+func TestL1AtRisk_InvalidThresholdAndLimit(t *testing.T) {
+	emb := newStubEmbedder(4)
+	s := newTestServer(emb)
+	defer s.recallCache.stop()
+
+	cases := []struct {
+		name string
+		uri  string
+	}{
+		{"threshold below zero", "reverie://l1/at_risk?threshold=-0.1"},
+		{"threshold above one", "reverie://l1/at_risk?threshold=1.5"},
+		{"threshold not a number", "reverie://l1/at_risk?threshold=abc"},
+		{"limit negative", "reverie://l1/at_risk?limit=-1"},
+		{"limit not a number", "reverie://l1/at_risk?limit=abc"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &mcpsdk.ReadResourceRequest{}
+			req.Params = &mcpsdk.ReadResourceParams{URI: tc.uri}
+			if _, err := s.handleL1AtRiskResource(context.Background(), req); err == nil {
+				t.Errorf("%s: expected error, got nil", tc.uri)
+			}
+		})
+	}
+}
+
 func TestStatsDaily_InvalidDateFormat(t *testing.T) {
 	emb := newStubEmbedder(4)
 	s := newTestServer(emb)
