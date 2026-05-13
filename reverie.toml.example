@@ -28,10 +28,12 @@ conflict_threshold = 0.92
 
 # Per-hop decay constant for graph-aware recall composite scoring:
 #   composite = seed_similarity * neighbor_retention * (graph_decay_per_hop ^ distance)
-# Halving (0.5) is a sensible default. Lower values penalize distant
-# neighbors more aggressively; higher values let multi-hop reaches keep
-# more of the seed's score.
-graph_decay_per_hop = 0.5
+# Default 0.8 -- chosen so graph hits remain competitive against vector
+# hits when the embedding model (e.g. nomic-embed-text) produces a high
+# similarity baseline. Drop toward 0.5 to penalize multi-hop reaches more
+# aggressively; raise toward 1.0 to let distant neighbors keep more of the
+# seed's score.
+graph_decay_per_hop = 0.8
 
 # Global cap on distinct neighbor memory IDs visited during graph BFS.
 # Prevents pathological blowup on dense graphs (e.g., a hub entity with

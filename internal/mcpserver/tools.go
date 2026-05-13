@@ -263,7 +263,7 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 
 		decayPerHop := s.cfg.Memory.GraphDecayPerHop
 		if decayPerHop <= 0 {
-			decayPerHop = 0.5
+			decayPerHop = 0.8
 		}
 		maxVisited := s.cfg.Memory.GraphMaxVisited
 		if maxVisited == 0 {

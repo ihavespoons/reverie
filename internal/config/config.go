@@ -37,7 +37,10 @@ type Memory struct {
 
 	// GraphDecayPerHop controls the per-hop decay in graph-aware recall
 	// composite scoring: composite = sim * retention * (GraphDecayPerHop ^ hop).
-	// Default 0.5. Range (0,1]. Zero or negative falls back to 0.5.
+	// Default 0.8. Range (0,1]. Zero or negative falls back to 0.8.
+	// 0.8 chosen so graph hits remain competitive against vector hits when
+	// embedding models (e.g. nomic-embed-text) produce a high similarity
+	// baseline; lower values penalize multi-hop reaches more aggressively.
 	GraphDecayPerHop float64 `toml:"graph_decay_per_hop"`
 
 	// GraphMaxVisited bounds the distinct neighbor count during graph BFS to
@@ -113,7 +116,7 @@ func Defaults() *Config {
 			SimilarityThreshold:           0.70,
 			RetentionThreshold:            0.30,
 			ConflictThreshold:             0.92,
-			GraphDecayPerHop:              0.5,
+			GraphDecayPerHop:              0.8,
 			GraphMaxVisited:               2000,
 			GraphMinRetentionForExpansion: 0.05,
 		},
