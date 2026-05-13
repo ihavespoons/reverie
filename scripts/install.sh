@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Reverie installer: builds the binary and wires it into Claude Code and/or
-# Claude Desktop on macOS / Linux.
+# Reverie installer: builds the binary and wires it into Claude Code,
+# Claude Desktop, and/or OpenCode on macOS / Linux.
 #
 # Defaults: Ollama provider with nomic-embed-text (no API keys required).
-# Re-run safe — config merges are idempotent; existing MCP servers are
+# Re-run safe -- config merges are idempotent; existing MCP servers are
 # preserved. Existing config files are backed up before rewrite.
 #
 # Usage:
@@ -12,6 +12,7 @@
 #   ./install.sh --skip-ollama    # don't touch Ollama (assume already configured)
 #   ./install.sh --code-only      # configure Claude Code only
 #   ./install.sh --desktop-only   # configure Claude Desktop only
+#   ./install.sh --opencode-only  # configure OpenCode only
 #   ./install.sh --uninstall      # remove the reverie entry from configured clients
 
 set -uo pipefail
@@ -38,17 +39,19 @@ DO_BUILD=1
 DO_OLLAMA=1
 DO_CODE=1
 DO_DESKTOP=1
+DO_OPENCODE=1
 UNINSTALL=0
 
 for arg in "$@"; do
     case "$arg" in
-        --skip-build)   DO_BUILD=0 ;;
-        --skip-ollama)  DO_OLLAMA=0 ;;
-        --code-only)    DO_DESKTOP=0 ;;
-        --desktop-only) DO_CODE=0 ;;
-        --uninstall)    UNINSTALL=1; DO_BUILD=0; DO_OLLAMA=0 ;;
+        --skip-build)    DO_BUILD=0 ;;
+        --skip-ollama)   DO_OLLAMA=0 ;;
+        --code-only)     DO_DESKTOP=0; DO_OPENCODE=0 ;;
+        --desktop-only)  DO_CODE=0; DO_OPENCODE=0 ;;
+        --opencode-only) DO_CODE=0; DO_DESKTOP=0 ;;
+        --uninstall)     UNINSTALL=1; DO_BUILD=0; DO_OLLAMA=0 ;;
         -h|--help)
-            sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *)
             fail "unknown argument: $arg (see --help)" ;;
@@ -70,6 +73,7 @@ case "$OS" in
         ;;
 esac
 CODE_CONFIG="$HOME/.claude/settings.json"
+OPENCODE_CONFIG="$HOME/.config/opencode/opencode.json"
 
 # --- utilities ---
 require_cmd() {
@@ -125,15 +129,67 @@ remove_config() {
     ok "$label: removed reverie entry (backup at $backup)"
 }
 
+merge_opencode_config() {
+    # Args: $1 = config path, $2 = binary path, $3 = client label (for messages)
+    # OpenCode uses a different schema -- `.mcp` (not `.mcpServers`) with
+    # `command` as an array [executable, ...args] and a `type: "local"` tag.
+    local cfg="$1"
+    local bin="$2"
+    local label="$3"
+
+    if [ ! -e "$cfg" ]; then
+        info "$label: creating $cfg"
+        mkdir -p "$(dirname "$cfg")"
+        printf '{\n  "mcp": {}\n}\n' > "$cfg"
+    else
+        local backup="$cfg.bak.$(date +%s)"
+        cp "$cfg" "$backup"
+        ok "$label: backed up existing config to $backup"
+    fi
+
+    local entry
+    entry=$(jq -n --arg cmd "$bin" '{type:"local", command:[$cmd, "serve"], enabled:true}')
+
+    local merged
+    merged=$(jq --argjson entry "$entry" '
+        .mcp = (.mcp // {}) |
+        .mcp.reverie = $entry
+    ' "$cfg") || fail "$label: jq merge failed"
+
+    printf '%s\n' "$merged" > "$cfg"
+    ok "$label: wired reverie into $cfg"
+}
+
+remove_opencode_config() {
+    local cfg="$1"
+    local label="$2"
+    if [ ! -e "$cfg" ]; then
+        info "$label: no config file at $cfg, nothing to remove"
+        return
+    fi
+    if ! jq -e '.mcp.reverie' "$cfg" >/dev/null 2>&1; then
+        info "$label: no reverie entry in $cfg"
+        return
+    fi
+    local backup="$cfg.bak.$(date +%s)"
+    cp "$cfg" "$backup"
+    local stripped
+    stripped=$(jq 'del(.mcp.reverie)' "$cfg") \
+        || fail "$label: jq strip failed"
+    printf '%s\n' "$stripped" > "$cfg"
+    ok "$label: removed reverie entry (backup at $backup)"
+}
+
 # --- preflight ---
 require_cmd jq "install via brew install jq, apt install jq, or equivalent"
 
 # --- uninstall path ---
 if [ "$UNINSTALL" -eq 1 ]; then
     info "uninstall mode"
-    [ "$DO_CODE"    -eq 1 ] && remove_config "$CODE_CONFIG"    "Claude Code"
-    [ "$DO_DESKTOP" -eq 1 ] && remove_config "$DESKTOP_CONFIG" "Claude Desktop"
-    info "binary at $(command -v reverie 2>/dev/null || echo "<not on PATH>") left in place — remove manually if desired"
+    [ "$DO_CODE"     -eq 1 ] && remove_config "$CODE_CONFIG"             "Claude Code"
+    [ "$DO_DESKTOP"  -eq 1 ] && remove_config "$DESKTOP_CONFIG"          "Claude Desktop"
+    [ "$DO_OPENCODE" -eq 1 ] && remove_opencode_config "$OPENCODE_CONFIG" "OpenCode"
+    info "binary at $(command -v reverie 2>/dev/null || echo "<not on PATH>") left in place -- remove manually if desired"
     exit 0
 fi
 
@@ -208,7 +264,15 @@ if [ "$DO_DESKTOP" -eq 1 ]; then
     if [ -e "$DESKTOP_CONFIG" ] || [ -d "$(dirname "$DESKTOP_CONFIG")" ]; then
         merge_config "$DESKTOP_CONFIG" "$BIN" "Claude Desktop"
     else
-        info "Claude Desktop config dir not detected — skipping (use --desktop-only to force)"
+        info "Claude Desktop config dir not detected -- skipping (use --desktop-only to force)"
+    fi
+fi
+
+if [ "$DO_OPENCODE" -eq 1 ]; then
+    if [ -e "$OPENCODE_CONFIG" ] || [ -d "$(dirname "$OPENCODE_CONFIG")" ]; then
+        merge_opencode_config "$OPENCODE_CONFIG" "$BIN" "OpenCode"
+    else
+        info "OpenCode config dir not detected at ~/.config/opencode -- skipping (use --opencode-only to force)"
     fi
 fi
 
@@ -218,6 +282,7 @@ ok "install complete"
 echo
 echo "${BOLD}Next steps:${RESET}"
 echo "  • Claude Code: type /exit and reopen, or restart the IDE."
-echo "  • Claude Desktop: ${BOLD}fully quit${RESET} (Cmd-Q on macOS) and reopen — closing the window is not enough."
+echo "  • Claude Desktop: ${BOLD}fully quit${RESET} (Cmd-Q on macOS) and reopen -- closing the window is not enough."
+echo "  • OpenCode: exit (Ctrl-C or :quit) and relaunch."
 echo
 echo "${DIM}Test: reverie status${RESET}"

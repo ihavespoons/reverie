@@ -6,7 +6,7 @@ Reverie is an MCP server that implements the Oblivion memory architecture (arXiv
 
 ## Quick start
 
-The fastest path: clone and run the installer. It builds the binary, pulls the Ollama embedding model if missing, and wires reverie into Claude Code and/or Claude Desktop (whichever it finds), preserving any existing MCP server entries.
+The fastest path: clone and run the installer. It builds the binary, pulls the Ollama embedding model if missing, and wires reverie into Claude Code, Claude Desktop, and/or OpenCode (whichever it finds), preserving any existing MCP server entries.
 
 ```bash
 git clone https://github.com/ihavespoons/reverie.git
@@ -14,7 +14,7 @@ cd reverie
 ./scripts/install.sh
 ```
 
-The installer is re-run safe (existing config is backed up before merge) and supports `--code-only`, `--desktop-only`, `--skip-ollama`, and `--uninstall` flags. See `./scripts/install.sh --help`.
+The installer is re-run safe (existing config is backed up before merge) and supports `--code-only`, `--desktop-only`, `--opencode-only`, `--skip-ollama`, and `--uninstall` flags. See `./scripts/install.sh --help`.
 
 ### Manual install
 
@@ -78,6 +78,32 @@ Desktop does NOT have Task/subagent support -- Gate A (`memory_apply_judgment`) 
 
 See [docs/claude-desktop-setup.md](docs/claude-desktop-setup.md) for details.
 
+## OpenCode setup
+
+Add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcp": {
+    "reverie": {
+      "type": "local",
+      "command": ["/path/to/reverie", "serve"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Note: the field is `mcp` (not `mcpServers`), and `command` is a single array containing the executable plus its args -- copying the Claude Code shape verbatim will not work.
+
+OpenCode uses `{env:VAR}` for env-var interpolation, not `${VAR}`.
+
+Gate A (`memory_apply_judgment`) IS available in OpenCode -- unlike Desktop -- provided you copy `opencode/agents/memory-judge.md` into `~/.config/opencode/agents/`. See [opencode/README.md](opencode/README.md) for the copy step.
+
+Restart OpenCode after adding the entry.
+
+See [docs/opencode-setup.md](docs/opencode-setup.md) for the full setup guide.
+
 ## Custom harness setup
 
 Subprocess the binary and speak MCP over stdio. Go: `exec.Command("reverie", "serve")` with piped stdin/stdout. Python: `subprocess.Popen(["reverie", "serve"])` with the `mcp` package.
@@ -88,15 +114,15 @@ See [docs/custom-harness.md](docs/custom-harness.md) for examples.
 
 ```
 +----------------------+      stdio MCP      +-----------------------------+
-| Claude Code / Desktop| <-----------------> | reverie serve (Go binary)   |
-| custom Go/Py harness |                     |   NO internal LLM calls     |
-|  +-- spawns Task     |                     |                             |
-|  |   subagent to     |                     |  Executor                   |
-|  |   judge candidates|                     |   +-- Decayer (gates B+C)   |
-|  |   (Gate A)        |                     |   +-- MemoryManager         |
-|  +-- calls write/    |                     |   +-- WorkingMemory (RAM)   |
-|      reinforce with  |                     |                             |
-|      its own         |                     |  Embed: OpenAI-compat HTTP  |
+| Claude Code, Desktop,| <-----------------> | reverie serve (Go binary)   |
+| OpenCode, or a       |                     |   NO internal LLM calls     |
+| custom Go/Py harness |                     |                             |
+|  +-- spawns Task     |                     |  Executor                   |
+|  |   subagent to     |                     |   +-- Decayer (gates B+C)   |
+|  |   judge candidates|                     |   +-- MemoryManager         |
+|  |   (Gate A)        |                     |   +-- WorkingMemory (RAM)   |
+|  +-- calls write/    |                     |                             |
+|      reinforce w/ own|                     |  Embed: OpenAI-compat HTTP  |
 |      classification  |                     |  (Ollama by default)        |
 +----------------------+                     |                             |
                                              |  Store: SQLite (WAL)        |
