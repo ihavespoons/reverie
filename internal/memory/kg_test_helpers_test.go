@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"testing"
 )
 
@@ -547,4 +548,342 @@ func kgRunCascadeOnDeleteFact(t *testing.T, newStore kgTestFactory) {
 	if ent.ID == "" {
 		t.Error("entity was cascade-deleted; should survive")
 	}
+}
+
+// --- Phase 7C: ExpandViaGraph test helpers ---
+
+// kgInsertFactInCluster wires up the default cluster on a fresh store
+// and inserts a fact with a derived content+embedding so each call
+// produces a unique row.
+func kgInsertFactInCluster(t *testing.T, s Store, content string) string {
+	t.Helper()
+	f := testdataFacts()[0]
+	f.ID = ""
+	f.Content = content
+	f.ContentHash = ""
+	// Embedding is irrelevant for these tests but must be non-empty.
+	f.Embedding = []float32{1, 0, 0, 0}
+	id, err := s.InsertFact(context.Background(), f)
+	if err != nil {
+		t.Fatalf("InsertFact %q: %v", content, err)
+	}
+	return id
+}
+
+// kgFindHits filters hits to those matching a (neighbor, seed) pair.
+// Returns the matched hits in ascending Distance order.
+func kgFindHits(hits []GraphHit, neighbor, seed string) []GraphHit {
+	var out []GraphHit
+	for _, h := range hits {
+		if h.NeighborID == neighbor && (seed == "" || h.SeedID == seed) {
+			out = append(out, h)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Distance < out[j].Distance })
+	return out
+}
+
+// kgRunExpandViaGraph_DirectEdge: M1 edge-> M2; expand from M1 hops=1
+// returns M2 at distance 1.
+func kgRunExpandViaGraph_DirectEdge(t *testing.T, newStore kgTestFactory) {
+	s := newStore(t)
+	ctx := context.Background()
+	m1 := kgInsertFactInCluster(t, s, "m1 content")
+	m2 := kgInsertFactInCluster(t, s, "m2 content")
+	if _, err := s.AddEdge(ctx, Edge{SrcID: m1, DstID: m2, EdgeType: "refines"}); err != nil {
+		t.Fatalf("AddEdge: %v", err)
+	}
+	hits, err := s.ExpandViaGraph(ctx, []string{m1}, 1, 0, 0)
+	if err != nil {
+		t.Fatalf("ExpandViaGraph: %v", err)
+	}
+	got := kgFindHits(hits, m2, m1)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 hit (m2 from m1), got %d, hits=%v", len(got), hits)
+	}
+	if got[0].Distance != 1 {
+		t.Errorf("distance = %d, want 1", got[0].Distance)
+	}
+	if got[0].NeighborLayer != string(TypeL2Semantic) {
+		t.Errorf("layer = %q, want %q", got[0].NeighborLayer, string(TypeL2Semantic))
+	}
+}
+
+// kgRunExpandViaGraph_EntityMention: M1 mentions E, M2 mentions E;
+// expand from M1 hops=2 returns M2 at distance 2.
+func kgRunExpandViaGraph_EntityMention(t *testing.T, newStore kgTestFactory) {
+	s := newStore(t)
+	ctx := context.Background()
+	m1 := kgInsertFactInCluster(t, s, "m1 entity")
+	m2 := kgInsertFactInCluster(t, s, "m2 entity")
+	eid, _, _, err := s.UpsertEntity(ctx, "shared", "concept", []float32{1, 0, 0})
+	if err != nil {
+		t.Fatalf("UpsertEntity: %v", err)
+	}
+	if _, err := s.AddEntityMentions(ctx, m1, []string{eid}, ""); err != nil {
+		t.Fatalf("AddEntityMentions m1: %v", err)
+	}
+	if _, err := s.AddEntityMentions(ctx, m2, []string{eid}, ""); err != nil {
+		t.Fatalf("AddEntityMentions m2: %v", err)
+	}
+	hits, err := s.ExpandViaGraph(ctx, []string{m1}, 2, 0, 0)
+	if err != nil {
+		t.Fatalf("ExpandViaGraph: %v", err)
+	}
+	got := kgFindHits(hits, m2, m1)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 hit (m2 from m1 via entity), got %d", len(got))
+	}
+	if got[0].Distance != 2 {
+		t.Errorf("distance = %d, want 2", got[0].Distance)
+	}
+	// hops=1 must NOT return m2 (entity hop costs 2).
+	hits1, err := s.ExpandViaGraph(ctx, []string{m1}, 1, 0, 0)
+	if err != nil {
+		t.Fatalf("ExpandViaGraph hops=1: %v", err)
+	}
+	if len(kgFindHits(hits1, m2, m1)) != 0 {
+		t.Errorf("hops=1 returned m2 via entity; expected exclusion")
+	}
+}
+
+// kgRunExpandViaGraph_TwoHopEdgeChain: M1->M2->M3 edges; expand from
+// M1 hops=2 returns both with correct distances.
+func kgRunExpandViaGraph_TwoHopEdgeChain(t *testing.T, newStore kgTestFactory) {
+	s := newStore(t)
+	ctx := context.Background()
+	m1 := kgInsertFactInCluster(t, s, "m1 chain")
+	m2 := kgInsertFactInCluster(t, s, "m2 chain")
+	m3 := kgInsertFactInCluster(t, s, "m3 chain")
+	if _, err := s.AddEdge(ctx, Edge{SrcID: m1, DstID: m2, EdgeType: "refines"}); err != nil {
+		t.Fatalf("AddEdge m1->m2: %v", err)
+	}
+	if _, err := s.AddEdge(ctx, Edge{SrcID: m2, DstID: m3, EdgeType: "refines"}); err != nil {
+		t.Fatalf("AddEdge m2->m3: %v", err)
+	}
+	hits, err := s.ExpandViaGraph(ctx, []string{m1}, 2, 0, 0)
+	if err != nil {
+		t.Fatalf("ExpandViaGraph: %v", err)
+	}
+	g2 := kgFindHits(hits, m2, m1)
+	g3 := kgFindHits(hits, m3, m1)
+	if len(g2) != 1 || g2[0].Distance != 1 {
+		t.Errorf("m2 from m1: got=%v, want one at distance=1", g2)
+	}
+	if len(g3) != 1 || g3[0].Distance != 2 {
+		t.Errorf("m3 from m1: got=%v, want one at distance=2", g3)
+	}
+}
+
+// kgRunExpandViaGraph_HubEntityNoCap: an entity mentioned by many
+// memories expands without per-seed truncation -- ExpandViaGraph has
+// no per-seed cap.
+func kgRunExpandViaGraph_HubEntityNoCap(t *testing.T, newStore kgTestFactory) {
+	s := newStore(t)
+	ctx := context.Background()
+	eid, _, _, err := s.UpsertEntity(ctx, "hub", "concept", []float32{1, 0, 0})
+	if err != nil {
+		t.Fatalf("UpsertEntity: %v", err)
+	}
+	const N = 12
+	ids := make([]string, N)
+	for i := 0; i < N; i++ {
+		mid := kgInsertFactInCluster(t, s, "hub-mem-"+itoa(i))
+		ids[i] = mid
+		if _, err := s.AddEntityMentions(ctx, mid, []string{eid}, ""); err != nil {
+			t.Fatalf("AddEntityMentions[%d]: %v", i, err)
+		}
+	}
+	// Use a large cap so no truncation occurs.
+	hits, err := s.ExpandViaGraph(ctx, []string{ids[0]}, 2, 0, 1000)
+	if err != nil {
+		t.Fatalf("ExpandViaGraph: %v", err)
+	}
+	// Should find all N-1 other memories at distance 2.
+	uniq := map[string]struct{}{}
+	for _, h := range hits {
+		if h.SeedID == ids[0] {
+			uniq[h.NeighborID] = struct{}{}
+		}
+	}
+	if len(uniq) != N-1 {
+		t.Errorf("hub expansion returned %d unique neighbors, want %d", len(uniq), N-1)
+	}
+}
+
+// kgRunExpandViaGraph_GlobalCapHonored: small maxVisited yields exactly
+// that many distinct visited memories (plus the seed already-visited).
+func kgRunExpandViaGraph_GlobalCapHonored(t *testing.T, newStore kgTestFactory) {
+	s := newStore(t)
+	ctx := context.Background()
+	const N = 10
+	ids := make([]string, N)
+	for i := 0; i < N; i++ {
+		ids[i] = kgInsertFactInCluster(t, s, "cap-mem-"+itoa(i))
+	}
+	// star from ids[0] to all others
+	for i := 1; i < N; i++ {
+		if _, err := s.AddEdge(ctx, Edge{SrcID: ids[0], DstID: ids[i], EdgeType: "refines"}); err != nil {
+			t.Fatalf("AddEdge: %v", err)
+		}
+	}
+	// maxVisited=4 -> seed(1) + 3 new = 4 total distinct memories.
+	// So at most 3 neighbor hits should be recorded.
+	hits, err := s.ExpandViaGraph(ctx, []string{ids[0]}, 2, 0, 4)
+	if err != nil {
+		t.Fatalf("ExpandViaGraph: %v", err)
+	}
+	uniq := map[string]struct{}{}
+	for _, h := range hits {
+		uniq[h.NeighborID] = struct{}{}
+	}
+	if len(uniq) > 3 {
+		t.Errorf("global cap honored: got %d unique neighbors, want <= 3 (cap=4 incl. seed)", len(uniq))
+	}
+	if len(uniq) == 0 {
+		t.Error("cap=4 should still allow some expansion; got zero")
+	}
+}
+
+// kgRunExpandViaGraph_RetentionPrefilter: a low-retention cluster
+// short-circuits BFS through its members.
+func kgRunExpandViaGraph_RetentionPrefilter(t *testing.T, newStore kgTestFactory) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	// Build two clusters with vastly different decay profiles.
+	freshCluster := ClusterNode{ID: "fresh-rp", Summary: "fresh", Utility: 1.0, Frequency: 1.0, TurnsSince: 0}
+	if err := s.CreateCluster(ctx, freshCluster); err != nil {
+		t.Fatalf("CreateCluster fresh: %v", err)
+	}
+	decayedCluster := ClusterNode{ID: "decayed-rp", Summary: "decayed", Utility: 0.0, Frequency: 0.0, TurnsSince: 100000}
+	if err := s.CreateCluster(ctx, decayedCluster); err != nil {
+		t.Fatalf("CreateCluster decayed: %v", err)
+	}
+
+	mkFact := func(content, cluster string) string {
+		f := testdataFacts()[0]
+		f.ID = ""
+		f.Content = content
+		f.ContentHash = ""
+		f.ClusterID = cluster
+		f.Embedding = []float32{1, 0, 0, 0}
+		id, err := s.InsertFact(ctx, f)
+		if err != nil {
+			t.Fatalf("InsertFact: %v", err)
+		}
+		return id
+	}
+
+	m1 := mkFact("rp m1", "fresh-rp")   // seed: high retention
+	m2 := mkFact("rp m2", "decayed-rp") // low retention -> pruned
+	m3 := mkFact("rp m3", "fresh-rp")   // beyond m2; unreachable since m2 pruned
+
+	if _, err := s.AddEdge(ctx, Edge{SrcID: m1, DstID: m2, EdgeType: "refines"}); err != nil {
+		t.Fatalf("AddEdge m1->m2: %v", err)
+	}
+	if _, err := s.AddEdge(ctx, Edge{SrcID: m2, DstID: m3, EdgeType: "refines"}); err != nil {
+		t.Fatalf("AddEdge m2->m3: %v", err)
+	}
+
+	hits, err := s.ExpandViaGraph(ctx, []string{m1}, 2, 0.5, 0)
+	if err != nil {
+		t.Fatalf("ExpandViaGraph: %v", err)
+	}
+	// m2 should be filtered (low retention) -> m3 also unreachable.
+	if len(kgFindHits(hits, m2, m1)) != 0 {
+		t.Errorf("m2 (decayed) appeared in hits; expected pre-filter exclusion")
+	}
+	if len(kgFindHits(hits, m3, m1)) != 0 {
+		t.Errorf("m3 reached past pruned m2; expected zero hits")
+	}
+}
+
+// kgRunExpandViaGraph_MultiSeedReturnsAllPairs: a neighbor reachable
+// from multiple seeds yields one GraphHit per seed.
+func kgRunExpandViaGraph_MultiSeedReturnsAllPairs(t *testing.T, newStore kgTestFactory) {
+	s := newStore(t)
+	ctx := context.Background()
+	s1 := kgInsertFactInCluster(t, s, "ms s1")
+	s2 := kgInsertFactInCluster(t, s, "ms s2")
+	mx := kgInsertFactInCluster(t, s, "ms mx")
+
+	// s1 -> mx (direct edge, dist=1)
+	if _, err := s.AddEdge(ctx, Edge{SrcID: s1, DstID: mx, EdgeType: "refines"}); err != nil {
+		t.Fatalf("AddEdge s1->mx: %v", err)
+	}
+	// s2 mentions entity E; mx mentions E -> 2 hop.
+	eid, _, _, err := s.UpsertEntity(ctx, "ms-ent", "concept", []float32{1, 0, 0})
+	if err != nil {
+		t.Fatalf("UpsertEntity: %v", err)
+	}
+	if _, err := s.AddEntityMentions(ctx, s2, []string{eid}, ""); err != nil {
+		t.Fatalf("AddEntityMentions s2: %v", err)
+	}
+	if _, err := s.AddEntityMentions(ctx, mx, []string{eid}, ""); err != nil {
+		t.Fatalf("AddEntityMentions mx: %v", err)
+	}
+
+	hits, err := s.ExpandViaGraph(ctx, []string{s1, s2}, 2, 0, 0)
+	if err != nil {
+		t.Fatalf("ExpandViaGraph: %v", err)
+	}
+	g1 := kgFindHits(hits, mx, s1)
+	g2 := kgFindHits(hits, mx, s2)
+	if len(g1) != 1 || g1[0].Distance != 1 {
+		t.Errorf("from s1: %v want one at distance=1", g1)
+	}
+	if len(g2) != 1 || g2[0].Distance != 2 {
+		t.Errorf("from s2: %v want one at distance=2", g2)
+	}
+}
+
+// kgRunExpandViaGraph_SameSeedShortestPath: within a single seed, if
+// the same neighbor is reachable both via edge (dist=1) and entity
+// (dist=2), only the dist=1 row is recorded.
+func kgRunExpandViaGraph_SameSeedShortestPath(t *testing.T, newStore kgTestFactory) {
+	s := newStore(t)
+	ctx := context.Background()
+	src := kgInsertFactInCluster(t, s, "ss src")
+	dst := kgInsertFactInCluster(t, s, "ss dst")
+	if _, err := s.AddEdge(ctx, Edge{SrcID: src, DstID: dst, EdgeType: "refines"}); err != nil {
+		t.Fatalf("AddEdge: %v", err)
+	}
+	// Also share an entity so the entity path can produce a dist=2 hit.
+	eid, _, _, err := s.UpsertEntity(ctx, "ss-ent", "concept", []float32{1, 0, 0})
+	if err != nil {
+		t.Fatalf("UpsertEntity: %v", err)
+	}
+	if _, err := s.AddEntityMentions(ctx, src, []string{eid}, ""); err != nil {
+		t.Fatalf("AddEntityMentions src: %v", err)
+	}
+	if _, err := s.AddEntityMentions(ctx, dst, []string{eid}, ""); err != nil {
+		t.Fatalf("AddEntityMentions dst: %v", err)
+	}
+
+	hits, err := s.ExpandViaGraph(ctx, []string{src}, 2, 0, 0)
+	if err != nil {
+		t.Fatalf("ExpandViaGraph: %v", err)
+	}
+	got := kgFindHits(hits, dst, src)
+	if len(got) != 1 {
+		t.Fatalf("same seed shortest path: got %d hits, want 1; hits=%v", len(got), got)
+	}
+	if got[0].Distance != 1 {
+		t.Errorf("distance = %d, want 1 (shortest path wins)", got[0].Distance)
+	}
+}
+
+// itoa is a tiny inline conversion to avoid pulling strconv into this
+// test file just for index suffixes.
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var digits []byte
+	for i > 0 {
+		digits = append([]byte{byte('0' + i%10)}, digits...)
+		i /= 10
+	}
+	return string(digits)
 }

@@ -36,6 +36,16 @@ type RecallInput struct {
 	Layer     string   `json:"layer,omitempty" jsonschema:"l2, l3, or both (default)"`
 	TagsAny   []string `json:"tags_any,omitempty" jsonschema:"restrict to memories with any of these tags"`
 	SessionID string   `json:"session_id,omitempty" jsonschema:"attach this call to a session; buffer updates on recall/write/reinforce"`
+
+	// ExpandViaGraph: when true and round==0, recall additionally walks
+	// memory_edges and entity_mentions from the vector seeds to surface
+	// graph neighbors. Default false. Ignored on round>=1.
+	ExpandViaGraph bool `json:"expand_via_graph,omitempty" jsonschema:"opt-in graph expansion on top of vector recall"`
+
+	// GraphHops: BFS depth budget for graph expansion. Clamped to [1,3].
+	// Defaults to 2 when ExpandViaGraph is true. Memory->entity->memory
+	// counts as 2 hops.
+	GraphHops int `json:"graph_hops,omitempty" jsonschema:"BFS depth for graph expansion (1..3, default 2)"`
 }
 
 // RecallCandidate is a single candidate in the recall result.
@@ -51,6 +61,15 @@ type RecallCandidate struct {
 	LinkedIDs  []string `json:"linked_ids,omitempty"`
 	ClusterID  string   `json:"cluster_id"`
 	Tags       []string `json:"tags,omitempty"`
+
+	// Distance: 0 for vector hits, >=1 for graph-expanded neighbors.
+	Distance int `json:"distance"`
+
+	// CompositeScore: the final ranking score. For vector hits this equals
+	// Similarity. For graph hits it is seed_similarity * neighbor_retention
+	// * (decay_per_hop ^ Distance), taking the MAX across seeds when the
+	// neighbor is reachable from multiple seeds.
+	CompositeScore float64 `json:"composite_score"`
 }
 
 // RecallOutput is the output schema for the memory_recall tool.
@@ -93,20 +112,28 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 	}
 
 	// Global cosine search.
-	candidates, err := s.store.GlobalSearch(ctx, queryVec, limit)
+	vectorCandidates, err := s.store.GlobalSearch(ctx, queryVec, limit)
 	if err != nil {
 		return nil, RecallOutput{}, fmt.Errorf("global search: %w", err)
 	}
 
+	// Capture seed similarities BEFORE filtering so a filtered-out vector hit
+	// can still seed graph expansion (per the design doc).
+	seedSimilarity := make(map[string]float64, len(vectorCandidates))
+	for _, c := range vectorCandidates {
+		seedSimilarity[c.ID()] = float64(c.Similarity)
+	}
+
 	// Apply optional filters post-cosine, pre-ranking. Empty filters pass through.
+	filteredCandidates := vectorCandidates
 	if in.ClusterID != "" || in.Subtype != "" || layerFilter != layerBoth || len(in.TagsAny) > 0 {
-		filtered := candidates[:0]
-		for _, c := range candidates {
+		filtered := vectorCandidates[:0]
+		for _, c := range vectorCandidates {
 			if passesRecallFilters(c, in.ClusterID, in.Subtype, layerFilter, in.TagsAny) {
 				filtered = append(filtered, c)
 			}
 		}
-		candidates = filtered
+		filteredCandidates = filtered
 	}
 
 	threshold := s.cfg.Memory.SimilarityThreshold
@@ -114,44 +141,70 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 		threshold = 0.70
 	}
 
-	out := RecallOutput{
-		RecallID:   uuid.New().String(),
-		Round:      in.Round,
-		Candidates: make([]RecallCandidate, len(candidates)),
+	// Decide whether graph expansion is honored: only on round 0.
+	doGraphExpansion := in.ExpandViaGraph && in.Round == 0
+	if in.ExpandViaGraph && in.Round >= 1 {
+		s.logger.Info("memory_recall: expand_via_graph ignored on round>=1", "round", in.Round)
 	}
 
-	// Parallel slice of per-candidate retention values so the session buffer
-	// update below can reuse the recall scoring without re-fetching clusters.
-	candidateRetentions := make([]float64, len(candidates))
+	// retentionCache and gateCCache eliminate redundant cluster lookups
+	// across the vector and graph populate paths.
+	retentionCache := make(map[string]float64)
+	gateCCache := make(map[string]bool)
+	clusterRetention := func(clusterID string) (float64, bool) {
+		if r, ok := retentionCache[clusterID]; ok {
+			return r, gateCCache[clusterID]
+		}
+		cl, gerr := s.store.GetCluster(ctx, clusterID)
+		if gerr != nil {
+			s.logger.Warn("memory_recall: get cluster failed", "cluster_id", clusterID, "err", gerr)
+			retentionCache[clusterID] = 0
+			gateCCache[clusterID] = false
+			return 0, false
+		}
+		if cl == nil {
+			retentionCache[clusterID] = 0
+			gateCCache[clusterID] = false
+			return 0, false
+		}
+		r := s.decayer.Retention(*cl)
+		g := s.decayer.GateC(*cl)
+		retentionCache[clusterID] = r
+		gateCCache[clusterID] = g
+		return r, g
+	}
 
-	for i, c := range candidates {
-		var retention float64
-		var gateCPass bool
+	// Build vector candidate map first.
+	byID := make(map[string]RecallCandidate)
+	// retentionByID tracks the per-candidate retention used downstream
+	// (session-buffer scoring needs this aligned with the final output).
+	retentionByID := make(map[string]float64)
+	// origCandidateByID maps id -> original Candidate (used by the
+	// session-buffer update so we can call recallBufferEntry).
+	origCandidateByID := make(map[string]memory.Candidate)
 
+	buildCandidateFromMemory := func(c memory.Candidate, similarity float32, distance int, composite float64, gateBOverride *bool) RecallCandidate {
 		clusterID := c.ClusterID()
-		cl, err := s.store.GetCluster(ctx, clusterID)
-		if err != nil {
-			s.logger.Warn("memory_recall: get cluster failed", "cluster_id", clusterID, "err", err)
+		retention, gateCPass := clusterRetention(clusterID)
+
+		gateBPass := float64(similarity) > threshold
+		if gateBOverride != nil {
+			gateBPass = *gateBOverride
 		}
-		if cl != nil {
-			retention = s.decayer.Retention(*cl)
-			gateCPass = s.decayer.GateC(*cl)
-		}
-		candidateRetentions[i] = retention
-		// If cluster not found (shouldn't happen): retention=0, gate_c_pass=false.
 
 		rc := RecallCandidate{
-			ID:         c.ID(),
-			Content:    c.Content(),
-			Layer:      string(c.Layer()),
-			Similarity: c.Similarity,
-			Retention:  retention,
-			GateBPass:  float64(c.Similarity) > threshold,
-			GateCPass:  gateCPass,
-			ClusterID:  clusterID,
+			ID:             c.ID(),
+			Content:        c.Content(),
+			Layer:          string(c.Layer()),
+			Similarity:     similarity,
+			Retention:      retention,
+			GateBPass:      gateBPass,
+			GateCPass:      gateCPass,
+			ClusterID:      clusterID,
+			Distance:       distance,
+			CompositeScore: composite,
 		}
 
-		// Set subtype and tags for facts; tags for episodes.
 		if c.Fact != nil {
 			rc.Subtype = c.Fact.Subtype
 			rc.Tags = normalizeTagsSlice(c.Fact.Tags)
@@ -161,58 +214,211 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 			rc.Tags = normalizeTagsSlice(nil)
 		}
 
-		// Fetch cross-type linked IDs. Backed by memory_edges with
-		// edge_type='evidence' (the retired fact_episode_links semantic).
+		// Cross-type linked IDs (edge_type='evidence').
+		var ownerID string
 		if c.Fact != nil {
-			edges, linkErr := s.store.ListEdges(ctx, c.Fact.ID, 1)
-			if linkErr != nil {
-				s.logger.Warn("memory_recall: list edges failed", "fact_id", c.Fact.ID, "err", linkErr)
-			}
-			for _, e := range edges {
-				if e.Edge.EdgeType != "evidence" {
-					continue
-				}
-				other := e.Edge.DstID
-				if e.Edge.SrcID != c.Fact.ID {
-					other = e.Edge.SrcID
-				}
-				rc.LinkedIDs = append(rc.LinkedIDs, other)
-			}
+			ownerID = c.Fact.ID
 		} else if c.Episode != nil {
-			edges, linkErr := s.store.ListEdges(ctx, c.Episode.ID, 1)
+			ownerID = c.Episode.ID
+		}
+		if ownerID != "" {
+			edges, linkErr := s.store.ListEdges(ctx, ownerID, 1)
 			if linkErr != nil {
-				s.logger.Warn("memory_recall: list edges failed", "episode_id", c.Episode.ID, "err", linkErr)
+				s.logger.Warn("memory_recall: list edges failed", "memory_id", ownerID, "err", linkErr)
 			}
 			for _, e := range edges {
 				if e.Edge.EdgeType != "evidence" {
 					continue
 				}
 				other := e.Edge.DstID
-				if e.Edge.SrcID != c.Episode.ID {
+				if e.Edge.SrcID != ownerID {
 					other = e.Edge.SrcID
 				}
 				rc.LinkedIDs = append(rc.LinkedIDs, other)
 			}
 		}
 
-		out.Candidates[i] = rc
+		retentionByID[rc.ID] = retention
+		origCandidateByID[rc.ID] = c
+		return rc
 	}
 
-	// Stash in recall cache for memory_apply_judgment.
+	for _, c := range filteredCandidates {
+		rc := buildCandidateFromMemory(c, c.Similarity, 0, float64(c.Similarity), nil)
+		byID[rc.ID] = rc
+	}
+
+	// Graph expansion (round 0 only).
+	if doGraphExpansion {
+		hops := in.GraphHops
+		if hops <= 0 {
+			hops = 2
+		}
+		if hops < 1 {
+			hops = 1
+		}
+		if hops > 3 {
+			hops = 3
+		}
+
+		decayPerHop := s.cfg.Memory.GraphDecayPerHop
+		if decayPerHop <= 0 {
+			decayPerHop = 0.5
+		}
+		maxVisited := s.cfg.Memory.GraphMaxVisited
+		if maxVisited == 0 {
+			maxVisited = 2000
+		}
+		minRet := s.cfg.Memory.GraphMinRetentionForExpansion
+		if minRet < 0 {
+			minRet = 0.05
+		}
+		// Note: minRet==0 is treated as "no filter" by the store.
+
+		seedIDs := make([]string, 0, len(seedSimilarity))
+		for id := range seedSimilarity {
+			seedIDs = append(seedIDs, id)
+		}
+
+		if len(seedIDs) > 0 {
+			hits, gerr := s.store.ExpandViaGraph(ctx, seedIDs, hops, minRet, maxVisited)
+			if gerr != nil {
+				return nil, RecallOutput{}, fmt.Errorf("graph expansion: %w", gerr)
+			}
+
+			falseVal := false
+			// Aggregate hits by neighbor id, keeping the MAX composite
+			// across seeds.
+			type bestHit struct {
+				distance  int
+				composite float64
+				layer     string
+			}
+			bestByNeighbor := make(map[string]bestHit)
+			for _, h := range hits {
+				seedSim := seedSimilarity[h.SeedID]
+				// Fetch neighbor (fact or episode) for retention lookup.
+				var neighborClusterID string
+				switch h.NeighborLayer {
+				case string(memory.TypeL2Semantic):
+					f, fErr := s.store.GetFact(ctx, h.NeighborID)
+					if fErr != nil || f == nil {
+						continue
+					}
+					neighborClusterID = f.ClusterID
+				case string(memory.TypeL3Episodic):
+					ep, eErr := s.store.GetEpisode(ctx, h.NeighborID)
+					if eErr != nil || ep == nil {
+						continue
+					}
+					neighborClusterID = ep.ClusterID
+				default:
+					continue
+				}
+				neighborRetention, _ := clusterRetention(neighborClusterID)
+				composite := seedSim * neighborRetention * math.Pow(decayPerHop, float64(h.Distance))
+
+				bh, exists := bestByNeighbor[h.NeighborID]
+				if !exists || composite > bh.composite {
+					bestByNeighbor[h.NeighborID] = bestHit{
+						distance:  h.Distance,
+						composite: composite,
+						layer:     h.NeighborLayer,
+					}
+				}
+			}
+
+			for nID, bh := range bestByNeighbor {
+				if existing, ok := byID[nID]; ok {
+					// Collision with vector hit: keep higher composite.
+					if bh.composite > existing.CompositeScore {
+						// Graph wins: rebuild with graph provenance.
+						c, cerr := loadCandidateByID(ctx, s.store, nID, bh.layer)
+						if cerr != nil || c == nil {
+							s.logger.Warn("memory_recall: load graph candidate failed", "id", nID, "err", cerr)
+							continue
+						}
+						// Apply optional filters uniformly.
+						if !passesRecallFilters(*c, in.ClusterID, in.Subtype, layerFilter, in.TagsAny) {
+							delete(byID, nID)
+							continue
+						}
+						rc := buildCandidateFromMemory(*c, 0, bh.distance, bh.composite, &falseVal)
+						byID[nID] = rc
+					}
+					continue
+				}
+				// New (graph-only) entry.
+				c, cerr := loadCandidateByID(ctx, s.store, nID, bh.layer)
+				if cerr != nil || c == nil {
+					s.logger.Warn("memory_recall: load graph candidate failed", "id", nID, "err", cerr)
+					continue
+				}
+				// Apply optional filters uniformly to graph-only candidates.
+				if !passesRecallFilters(*c, in.ClusterID, in.Subtype, layerFilter, in.TagsAny) {
+					continue
+				}
+				rc := buildCandidateFromMemory(*c, 0, bh.distance, bh.composite, &falseVal)
+				byID[nID] = rc
+			}
+		}
+	}
+
+	// Flatten + sort by composite score descending.
+	merged := make([]RecallCandidate, 0, len(byID))
+	for _, rc := range byID {
+		merged = append(merged, rc)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].CompositeScore != merged[j].CompositeScore {
+			return merged[i].CompositeScore > merged[j].CompositeScore
+		}
+		// Deterministic tiebreak by ID.
+		return merged[i].ID < merged[j].ID
+	})
+	if len(merged) > limit {
+		merged = merged[:limit]
+	}
+
+	out := RecallOutput{
+		RecallID:   uuid.New().String(),
+		Round:      in.Round,
+		Candidates: merged,
+	}
+
+	// Stash in recall cache for memory_apply_judgment. Only vector
+	// candidates (with similarity) are cached -- graph hits have no
+	// query-cosine and apply_judgment expects similarity-bearing rows.
 	s.recallCache.put(out.RecallID, &cachedRecall{
 		queryVec:   queryVec,
-		candidates: candidates,
+		candidates: filteredCandidates,
 		round:      in.Round,
 		createdAt:  time.Now(),
 	})
 
 	// Session buffer update: append each returned candidate with the
-	// composite score. Unknown or closed session_id errors; snapshot
-	// failures are swallowed (the recall itself already succeeded).
+	// composite score, mirroring the pre-7C behavior (vector path) and
+	// extending it to graph hits where the underlying Candidate is known.
 	budgetMax := s.bufferBudgetMax()
 	if err := s.applySessionMutation(ctx, in.SessionID, func(wm *memory.WorkingMemory) {
-		for i, c := range candidates {
-			memory.AppendToBuffer(wm, recallBufferEntry(c, candidateRetentions[i]), budgetMax)
+		for _, rc := range merged {
+			origC, ok := origCandidateByID[rc.ID]
+			if !ok {
+				continue
+			}
+			// For graph-only hits, similarity is 0; recallBufferEntry
+			// uses Candidate.Similarity which equals rc.Similarity here
+			// (set on the vector path). For graph hits Similarity=0
+			// would zero the buffer score; use composite instead.
+			c := origC
+			if rc.Distance > 0 {
+				// Substitute composite for buffer scoring purposes.
+				// Build a synthetic Candidate by copying and overriding similarity.
+				synth := origC
+				synth.Similarity = float32(rc.CompositeScore)
+				c = synth
+			}
+			memory.AppendToBuffer(wm, recallBufferEntry(c, retentionByID[rc.ID]), budgetMax)
 		}
 	}); err != nil {
 		return nil, RecallOutput{}, err
@@ -220,6 +426,33 @@ func (s *Server) handleRecall(ctx context.Context, _ *mcpsdk.CallToolRequest, in
 
 	s.logger.Info("memory_recall", "recall_id", out.RecallID, "candidates", len(out.Candidates), "round", in.Round, "session_id", in.SessionID)
 	return nil, out, nil
+}
+
+// loadCandidateByID looks up a memory ID in the layer indicated and
+// returns a Candidate wrapping it (Similarity=0 since this is a
+// non-vector path). Returns (nil, nil) if not found.
+func loadCandidateByID(ctx context.Context, store memory.Store, id, layer string) (*memory.Candidate, error) {
+	switch layer {
+	case string(memory.TypeL2Semantic):
+		f, err := store.GetFact(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if f == nil {
+			return nil, nil
+		}
+		return &memory.Candidate{Fact: f}, nil
+	case string(memory.TypeL3Episodic):
+		ep, err := store.GetEpisode(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if ep == nil {
+			return nil, nil
+		}
+		return &memory.Candidate{Episode: ep}, nil
+	}
+	return nil, nil
 }
 
 // layerFilter represents the normalized Recall layer filter.

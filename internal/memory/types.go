@@ -308,3 +308,15 @@ type NeighborEntity struct {
 	EntityType string
 	Distance   int
 }
+
+// GraphHit is one (neighbor, seed) reach produced by ExpandViaGraph.
+// The same neighbor reached from multiple seeds appears as multiple
+// GraphHits -- the recall handler computes composite scores from each
+// and takes the MAX, since shortest distance is not a reliable proxy
+// for best composite when per-seed similarities differ.
+type GraphHit struct {
+	NeighborID    string
+	NeighborLayer string // "l2_semantic" or "l3_episodic"
+	SeedID        string
+	Distance      int // 1..hops
+}

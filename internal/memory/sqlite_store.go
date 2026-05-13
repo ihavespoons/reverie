@@ -1385,6 +1385,417 @@ func (s *sqliteStore) ListEntitiesByMemoryIDs(ctx context.Context, memoryIDs []s
 	return out, nil
 }
 
+// Phase 7C: ExpandViaGraph implementation -- see docs/design/phase-7c-graph-aware-recall.md.
+//
+// BFS walks memory_edges and entity_mentions outward from seedIDs to at
+// most hops levels deep, returning one GraphHit per (neighbor, seed)
+// pair at that pair's shortest distance. Hops clamped to [1,3]
+// defensively. minRetention<=0 disables the retention pre-filter;
+// maxVisited<=0 disables the global visited cap. Cluster retention is
+// computed via the pure Ebbinghaus formula (the store stays decoupled
+// from the decayer).
+func (s *sqliteStore) ExpandViaGraph(ctx context.Context, seedIDs []string, hops int, minRetention float64, maxVisited int) ([]GraphHit, error) {
+	if hops < 1 {
+		hops = 1
+	}
+	if hops > 3 {
+		hops = 3
+	}
+	if len(seedIDs) == 0 {
+		return nil, nil
+	}
+
+	type pairKey struct {
+		mem  string
+		seed string
+	}
+	type frontierEntry struct {
+		mem  string
+		seed string
+	}
+
+	bestPair := make(map[pairKey]int)
+	globalVisited := make(map[string]struct{})
+	var frontier []frontierEntry
+
+	for _, sid := range seedIDs {
+		if _, dup := globalVisited[sid]; dup {
+			continue
+		}
+		globalVisited[sid] = struct{}{}
+		bestPair[pairKey{sid, sid}] = 0
+		frontier = append(frontier, frontierEntry{mem: sid, seed: sid})
+	}
+
+	results := make([]GraphHit, 0)
+
+	clusterRetention := make(map[string]float64)
+	getClusterRetention := func(clusterID string) (float64, error) {
+		if r, ok := clusterRetention[clusterID]; ok {
+			return r, nil
+		}
+		cl, err := s.GetCluster(ctx, clusterID)
+		if err != nil {
+			return 0, err
+		}
+		if cl == nil {
+			clusterRetention[clusterID] = 0
+			return 0, nil
+		}
+		r := ebbinghaus.Retention(cl.TurnsSince, cl.Utility, cl.Frequency, ebbinghaus.DefaultTemperature)
+		clusterRetention[clusterID] = r
+		return r, nil
+	}
+
+	// resolveMemoryLayer returns (layer, clusterID, true) for facts/episodes,
+	// or ("", "", false) when the id is an entity / unknown.
+	memoryLayerCache := make(map[string]struct {
+		layer     string
+		clusterID string
+		ok        bool
+	})
+	resolveMemoryLayer := func(id string) (string, string, bool, error) {
+		if cached, ok := memoryLayerCache[id]; ok {
+			return cached.layer, cached.clusterID, cached.ok, nil
+		}
+		var clusterID string
+		err := s.db.QueryRowContext(ctx, `SELECT cluster_id FROM facts WHERE id = ?`, id).Scan(&clusterID)
+		if err == nil {
+			memoryLayerCache[id] = struct {
+				layer     string
+				clusterID string
+				ok        bool
+			}{string(TypeL2Semantic), clusterID, true}
+			return string(TypeL2Semantic), clusterID, true, nil
+		}
+		if err != sql.ErrNoRows {
+			return "", "", false, fmt.Errorf("sqlite store: expand via graph: facts lookup: %w", err)
+		}
+		err = s.db.QueryRowContext(ctx, `SELECT cluster_id FROM episodes WHERE id = ?`, id).Scan(&clusterID)
+		if err == nil {
+			memoryLayerCache[id] = struct {
+				layer     string
+				clusterID string
+				ok        bool
+			}{string(TypeL3Episodic), clusterID, true}
+			return string(TypeL3Episodic), clusterID, true, nil
+		}
+		if err != sql.ErrNoRows {
+			return "", "", false, fmt.Errorf("sqlite store: expand via graph: episodes lookup: %w", err)
+		}
+		memoryLayerCache[id] = struct {
+			layer     string
+			clusterID string
+			ok        bool
+		}{"", "", false}
+		return "", "", false, nil
+	}
+
+	// Entity retention cache.
+	entityRetention := make(map[string]float64)
+	getEntityRetention := func(id string) (float64, bool, error) {
+		if r, ok := entityRetention[id]; ok {
+			return r, true, nil
+		}
+		var r float64
+		err := s.db.QueryRowContext(ctx, `SELECT retention FROM entities WHERE id = ?`, id).Scan(&r)
+		if err == nil {
+			entityRetention[id] = r
+			return r, true, nil
+		}
+		if err == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("sqlite store: expand via graph: entity retention: %w", err)
+	}
+
+	capReached := func() bool {
+		return maxVisited > 0 && len(globalVisited) >= maxVisited
+	}
+
+	for depth := 1; depth <= hops; depth++ {
+		if len(frontier) == 0 {
+			break
+		}
+		if capReached() {
+			break
+		}
+
+		// Group current frontier by memory ID (a single memory may appear
+		// with multiple seed parents in the frontier).
+		frontierMems := make(map[string][]string)
+		for _, fe := range frontier {
+			frontierMems[fe.mem] = append(frontierMems[fe.mem], fe.seed)
+		}
+		// Build placeholder list once for batched IN-clauses.
+		frontierIDs := make([]string, 0, len(frontierMems))
+		for mid := range frontierMems {
+			frontierIDs = append(frontierIDs, mid)
+		}
+
+		var nextFrontier []frontierEntry
+		stopAll := false
+
+		// (a) memory_edges -- one batched query.
+		if len(frontierIDs) > 0 {
+			placeholders := make([]string, len(frontierIDs))
+			args := make([]any, 0, len(frontierIDs)*2)
+			for i, id := range frontierIDs {
+				placeholders[i] = "?"
+				args = append(args, id)
+			}
+			for _, id := range frontierIDs {
+				args = append(args, id)
+			}
+			query := fmt.Sprintf(
+				`SELECT src_id, dst_id FROM memory_edges WHERE src_id IN (%s) OR dst_id IN (%s)`,
+				strings.Join(placeholders, ","),
+				strings.Join(placeholders, ","),
+			)
+			rows, err := s.db.QueryContext(ctx, query, args...)
+			if err != nil {
+				return nil, fmt.Errorf("sqlite store: expand via graph: edges query: %w", err)
+			}
+			type edgePair struct {
+				src string
+				dst string
+			}
+			var edgePairs []edgePair
+			for rows.Next() {
+				var ep edgePair
+				if err := rows.Scan(&ep.src, &ep.dst); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("sqlite store: expand via graph: edges scan: %w", err)
+				}
+				edgePairs = append(edgePairs, ep)
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("sqlite store: expand via graph: edges rows: %w", err)
+			}
+			rows.Close()
+
+			tryReach := func(parent, other string, seeds []string) (bool, error) {
+				layer, clusterID, isMem, err := resolveMemoryLayer(other)
+				if err != nil {
+					return false, err
+				}
+				if !isMem {
+					return false, nil
+				}
+				if other == parent {
+					return false, nil
+				}
+				if minRetention > 0 {
+					r, err := getClusterRetention(clusterID)
+					if err != nil {
+						return false, err
+					}
+					if r < minRetention {
+						return false, nil
+					}
+				}
+				for _, seedID := range seeds {
+					if other == seedID {
+						continue
+					}
+					key := pairKey{mem: other, seed: seedID}
+					if _, exists := bestPair[key]; exists {
+						continue
+					}
+					bestPair[key] = depth
+					results = append(results, GraphHit{
+						NeighborID:    other,
+						NeighborLayer: layer,
+						SeedID:        seedID,
+						Distance:      depth,
+					})
+					nextFrontier = append(nextFrontier, frontierEntry{mem: other, seed: seedID})
+					if _, gv := globalVisited[other]; !gv {
+						globalVisited[other] = struct{}{}
+						if capReached() {
+							return true, nil
+						}
+					}
+				}
+				return false, nil
+			}
+
+		edgeLoop:
+			for _, ep := range edgePairs {
+				seedsFromSrc, srcIn := frontierMems[ep.src]
+				seedsFromDst, dstIn := frontierMems[ep.dst]
+				if srcIn {
+					stop, err := tryReach(ep.src, ep.dst, seedsFromSrc)
+					if err != nil {
+						return nil, err
+					}
+					if stop {
+						stopAll = true
+						break edgeLoop
+					}
+				}
+				if dstIn {
+					stop, err := tryReach(ep.dst, ep.src, seedsFromDst)
+					if err != nil {
+						return nil, err
+					}
+					if stop {
+						stopAll = true
+						break edgeLoop
+					}
+				}
+			}
+		}
+
+		if stopAll {
+			break
+		}
+
+		// (b) memory->entity->memory -- 2-hop entity mediator. Only
+		// records hits if depth+1 <= hops.
+		if depth+1 <= hops && !capReached() && len(frontierIDs) > 0 {
+			// Batched: memory_id -> entity_id for all frontier mems.
+			placeholders := make([]string, len(frontierIDs))
+			args := make([]any, len(frontierIDs))
+			for i, id := range frontierIDs {
+				placeholders[i] = "?"
+				args[i] = id
+			}
+			q1 := fmt.Sprintf(
+				`SELECT memory_id, entity_id FROM entity_mentions WHERE memory_id IN (%s)`,
+				strings.Join(placeholders, ","),
+			)
+			rows, err := s.db.QueryContext(ctx, q1, args...)
+			if err != nil {
+				return nil, fmt.Errorf("sqlite store: expand via graph: mentions out: %w", err)
+			}
+			memToEntities := make(map[string][]string)
+			entitySet := make(map[string]struct{})
+			for rows.Next() {
+				var mid, eid string
+				if err := rows.Scan(&mid, &eid); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("sqlite store: expand via graph: mentions out scan: %w", err)
+				}
+				if minRetention > 0 {
+					r, ok, eerr := getEntityRetention(eid)
+					if eerr != nil {
+						rows.Close()
+						return nil, eerr
+					}
+					if ok && r < minRetention {
+						continue
+					}
+				}
+				memToEntities[mid] = append(memToEntities[mid], eid)
+				entitySet[eid] = struct{}{}
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("sqlite store: expand via graph: mentions out rows: %w", err)
+			}
+			rows.Close()
+
+			if len(entitySet) > 0 {
+				// Batched: entity_id -> memory_id for all gathered entities.
+				ents := make([]string, 0, len(entitySet))
+				for eid := range entitySet {
+					ents = append(ents, eid)
+				}
+				ph2 := make([]string, len(ents))
+				args2 := make([]any, len(ents))
+				for i, e := range ents {
+					ph2[i] = "?"
+					args2[i] = e
+				}
+				q2 := fmt.Sprintf(
+					`SELECT entity_id, memory_id FROM entity_mentions WHERE entity_id IN (%s)`,
+					strings.Join(ph2, ","),
+				)
+				rows2, err := s.db.QueryContext(ctx, q2, args2...)
+				if err != nil {
+					return nil, fmt.Errorf("sqlite store: expand via graph: mentions in: %w", err)
+				}
+				entityToMems := make(map[string][]string)
+				for rows2.Next() {
+					var eid, mid string
+					if err := rows2.Scan(&eid, &mid); err != nil {
+						rows2.Close()
+						return nil, fmt.Errorf("sqlite store: expand via graph: mentions in scan: %w", err)
+					}
+					entityToMems[eid] = append(entityToMems[eid], mid)
+				}
+				if err := rows2.Err(); err != nil {
+					rows2.Close()
+					return nil, fmt.Errorf("sqlite store: expand via graph: mentions in rows: %w", err)
+				}
+				rows2.Close()
+
+				stopEnt := false
+			outerEnt:
+				for parentMem, seeds := range frontierMems {
+					eids := memToEntities[parentMem]
+					for _, eid := range eids {
+						mids := entityToMems[eid]
+						for _, n := range mids {
+							if n == parentMem {
+								continue
+							}
+							layer, clusterID, isMem, lerr := resolveMemoryLayer(n)
+							if lerr != nil {
+								return nil, lerr
+							}
+							if !isMem {
+								continue
+							}
+							if minRetention > 0 {
+								r, rerr := getClusterRetention(clusterID)
+								if rerr != nil {
+									return nil, rerr
+								}
+								if r < minRetention {
+									continue
+								}
+							}
+							for _, seedID := range seeds {
+								if n == seedID {
+									continue
+								}
+								key := pairKey{mem: n, seed: seedID}
+								if _, exists := bestPair[key]; exists {
+									continue
+								}
+								bestPair[key] = depth + 1
+								results = append(results, GraphHit{
+									NeighborID:    n,
+									NeighborLayer: layer,
+									SeedID:        seedID,
+									Distance:      depth + 1,
+								})
+								if _, gv := globalVisited[n]; !gv {
+									globalVisited[n] = struct{}{}
+									if capReached() {
+										stopEnt = true
+										break outerEnt
+									}
+								}
+							}
+						}
+					}
+				}
+				if stopEnt {
+					break
+				}
+			}
+		}
+
+		frontier = nextFrontier
+	}
+
+	return results, nil
+}
+
 // CountEntities returns the total number of entity rows. Cheap COUNT(*)
 // behind the SQLite covering index — fine for reverie://status.
 func (s *sqliteStore) CountEntities(ctx context.Context) (int, error) {

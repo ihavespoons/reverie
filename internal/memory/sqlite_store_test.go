@@ -2427,3 +2427,30 @@ func TestSQLiteListEntitiesByMemoryIDs(t *testing.T) {
 	kgRunListEntitiesByMemoryIDs(t, sqliteFactory)
 }
 func TestSQLiteCountEntitiesAndEdges(t *testing.T) { kgRunCountEntitiesAndEdges(t, sqliteFactory) }
+
+// --- Phase 7C: ExpandViaGraph ---
+
+func TestSQLiteExpandViaGraph_DirectEdge(t *testing.T) {
+	kgRunExpandViaGraph_DirectEdge(t, sqliteFactory)
+}
+func TestSQLiteExpandViaGraph_EntityMention(t *testing.T) {
+	kgRunExpandViaGraph_EntityMention(t, sqliteFactory)
+}
+func TestSQLiteExpandViaGraph_TwoHopEdgeChain(t *testing.T) {
+	kgRunExpandViaGraph_TwoHopEdgeChain(t, sqliteFactory)
+}
+func TestSQLiteExpandViaGraph_HubEntityNoCap(t *testing.T) {
+	kgRunExpandViaGraph_HubEntityNoCap(t, sqliteFactory)
+}
+func TestSQLiteExpandViaGraph_GlobalCapHonored(t *testing.T) {
+	kgRunExpandViaGraph_GlobalCapHonored(t, sqliteFactory)
+}
+func TestSQLiteExpandViaGraph_RetentionPrefilter(t *testing.T) {
+	kgRunExpandViaGraph_RetentionPrefilter(t, sqliteFactory)
+}
+func TestSQLiteExpandViaGraph_MultiSeedReturnsAllPairs(t *testing.T) {
+	kgRunExpandViaGraph_MultiSeedReturnsAllPairs(t, sqliteFactory)
+}
+func TestSQLiteExpandViaGraph_SameSeedShortestPath(t *testing.T) {
+	kgRunExpandViaGraph_SameSeedShortestPath(t, sqliteFactory)
+}

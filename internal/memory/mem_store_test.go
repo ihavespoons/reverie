@@ -2223,3 +2223,28 @@ func TestMemListEntityNeighbors_Hops1(t *testing.T) { kgRunListEntityNeighborsHo
 func TestMemCascadeOnDeleteFact(t *testing.T)       { kgRunCascadeOnDeleteFact(t, memFactory) }
 func TestMemListEntitiesByMemoryIDs(t *testing.T)   { kgRunListEntitiesByMemoryIDs(t, memFactory) }
 func TestMemCountEntitiesAndEdges(t *testing.T)     { kgRunCountEntitiesAndEdges(t, memFactory) }
+
+// --- Phase 7C: ExpandViaGraph ---
+
+func TestMemExpandViaGraph_DirectEdge(t *testing.T) { kgRunExpandViaGraph_DirectEdge(t, memFactory) }
+func TestMemExpandViaGraph_EntityMention(t *testing.T) {
+	kgRunExpandViaGraph_EntityMention(t, memFactory)
+}
+func TestMemExpandViaGraph_TwoHopEdgeChain(t *testing.T) {
+	kgRunExpandViaGraph_TwoHopEdgeChain(t, memFactory)
+}
+func TestMemExpandViaGraph_HubEntityNoCap(t *testing.T) {
+	kgRunExpandViaGraph_HubEntityNoCap(t, memFactory)
+}
+func TestMemExpandViaGraph_GlobalCapHonored(t *testing.T) {
+	kgRunExpandViaGraph_GlobalCapHonored(t, memFactory)
+}
+func TestMemExpandViaGraph_RetentionPrefilter(t *testing.T) {
+	kgRunExpandViaGraph_RetentionPrefilter(t, memFactory)
+}
+func TestMemExpandViaGraph_MultiSeedReturnsAllPairs(t *testing.T) {
+	kgRunExpandViaGraph_MultiSeedReturnsAllPairs(t, memFactory)
+}
+func TestMemExpandViaGraph_SameSeedShortestPath(t *testing.T) {
+	kgRunExpandViaGraph_SameSeedShortestPath(t, memFactory)
+}

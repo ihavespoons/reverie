@@ -143,6 +143,33 @@ type Store interface {
 	// memory_edges rows where both endpoints resolve to entities.
 	ListEntityNeighbors(ctx context.Context, entityID string, hops int) (memories []NeighborMemory, entities []NeighborEntity, err error)
 
+	// ExpandViaGraph walks memory_edges and entity_mentions outward from
+	// the given seed memory IDs up to hops levels deep (clamped 1..3).
+	// Each iteration follows both (a) memory_edges in either direction and
+	// (b) memory->entity via entity_mentions, then entity->memory via
+	// entity_mentions (the entity hop counts as 1 toward depth, so an
+	// M->E->M' traversal is 2 hops total).
+	//
+	// Returns one GraphHit per (neighbor, seed) pair reached; within a
+	// single seed the shortest distance is kept. The same neighbor reached
+	// from multiple seeds produces multiple hits -- callers compute MAX
+	// composite score across them.
+	//
+	// Pre-filter: neighbors whose retention (cluster retention for facts/
+	// episodes, own retention for entities used as mediators) is below
+	// minRetention are skipped during BFS. Global cap: when the count of
+	// distinct neighbor memory IDs reaches maxVisited, further expansion
+	// stops.
+	//
+	// Entity IDs are NEVER returned -- they are traversal mediators only.
+	ExpandViaGraph(
+		ctx context.Context,
+		seedIDs []string,
+		hops int,
+		minRetention float64,
+		maxVisited int,
+	) ([]GraphHit, error)
+
 	// ListEntitiesByMemoryIDs returns the deduped set of entity IDs
 	// mentioned by any of the supplied memory IDs. The session-end path
 	// uses this to translate buffered memory IDs into the access set for

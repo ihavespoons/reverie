@@ -34,6 +34,22 @@ type Memory struct {
 	SimilarityThreshold float64 `toml:"similarity_threshold"`
 	RetentionThreshold  float64 `toml:"retention_threshold"`
 	ConflictThreshold   float64 `toml:"conflict_threshold"`
+
+	// GraphDecayPerHop controls the per-hop decay in graph-aware recall
+	// composite scoring: composite = sim * retention * (GraphDecayPerHop ^ hop).
+	// Default 0.5. Range (0,1]. Zero or negative falls back to 0.5.
+	GraphDecayPerHop float64 `toml:"graph_decay_per_hop"`
+
+	// GraphMaxVisited bounds the distinct neighbor count during graph BFS to
+	// prevent pathological blowup on dense graphs. Default 2000. Zero or
+	// negative means unbounded (not recommended).
+	GraphMaxVisited int `toml:"graph_max_visited"`
+
+	// GraphMinRetentionForExpansion skips graph neighbors whose retention is
+	// below this threshold during BFS -- decayed memories don't pollute the
+	// candidate set and reduce global-cap pressure. Default 0.05. Zero or
+	// negative means no pre-filter.
+	GraphMinRetentionForExpansion float64 `toml:"graph_min_retention_for_expansion"`
 }
 
 // Decay configures the Ebbinghaus retention curve and utility/frequency learning rates.
@@ -92,11 +108,14 @@ func Defaults() *Config {
 			DBPath: "~/.local/share/reverie/reverie.db",
 		},
 		Memory: Memory{
-			SlidingWindowK:      20,
-			CacheBudgetMax:      50,
-			SimilarityThreshold: 0.70,
-			RetentionThreshold:  0.30,
-			ConflictThreshold:   0.92,
+			SlidingWindowK:                20,
+			CacheBudgetMax:                50,
+			SimilarityThreshold:           0.70,
+			RetentionThreshold:            0.30,
+			ConflictThreshold:             0.92,
+			GraphDecayPerHop:              0.5,
+			GraphMaxVisited:               2000,
+			GraphMinRetentionForExpansion: 0.05,
 		},
 		Decay: Decay{
 			Temperature:        10.0,

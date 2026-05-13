@@ -148,7 +148,7 @@ See [docs/custom-harness.md](docs/custom-harness.md) for examples.
 
 | Tool | Purpose | When to call |
 |---|---|---|
-| `memory_recall` | Search memory by query. Returns ranked candidates with gate pass flags. Accepts optional `session_id` to auto-update the session buffer. | Session start; before architectural decisions; when referencing prior context. |
+| `memory_recall` | Search memory by query. Returns ranked candidates with gate pass flags. Accepts optional `session_id` to auto-update the session buffer; set `expand_via_graph: true` (with optional `graph_hops`) to walk the knowledge graph from vector seeds and surface reachable neighbors. | Session start; before architectural decisions; when referencing prior context; "what do I know about X" queries (with `expand_via_graph: true`). |
 | `memory_write` | Store a new fact (L2) or episode (L3). Accepts optional `session_id`. | When the caller decides something is durable knowledge. |
 | `memory_apply_judgment` | Apply Gate A verdicts from a subagent judge to a recall result. Accepts optional `session_id`. | After `memory_recall` when >5 candidates or staleness matters. |
 | `memory_reinforce` | Boost utility of memories actually used in a response. Accepts optional `session_id`. | After using recalled memories. |
@@ -204,6 +204,18 @@ Reverie's graph layer connects memories (L2 facts, L3 episodes) and entities thr
 - `file`, `repo`, `library`, `concept`, `person`, `command` -- the hosts' typical extractions.
 - Free-form: callers can store any string; reverie does not enforce a closed set.
 - Dedup: two entities with the same `(name, entity_type)` always merge; entities differing only in `entity_type` are distinct, so `"foo" (file)` and `"foo" (concept)` are two different entities.
+
+### Graph-aware recall
+
+Vector recall finds memories whose text is similar to the query; graph expansion finds memories related to those seeds *through structure* -- direct edges (`causes` / `refines` / `contradicts` / ...) and shared entity mentions. Set `expand_via_graph: true` on `memory_recall` to walk the graph from each vector seed and merge reachable neighbors into the candidate set. This is the recommended mode for "what do I know about file X" questions, where the answer memories often don't share keywords with the query.
+
+Neighbors are scored by `composite = seed_similarity * neighbor_retention * (graph_decay_per_hop ^ distance)`. With the default `graph_decay_per_hop = 0.5` and the default hop budget of 2, a memory that only shares an entity with a vector seed (memory -> entity -> memory, distance 2) still reaches the candidate set, scored at a quarter of the seed's contribution. `graph_hops` (1-3) overrides the budget per call.
+
+Each `RecallCandidate` carries a `distance` field: `0` for vector hits, `>= 1` for graph neighbors at that BFS depth. Graph-only neighbors have `similarity = 0`, `gate_b_pass = false` deterministically (they were not found by cosine similarity, so the similarity gate does not apply). The `limit` is applied after merge -- top-N by `composite_score` survives, so a request for 10 results may return any mix of vector and graph hits.
+
+Hub entities (entities mentioned by many memories) expand without per-seed truncation -- "memories about popular-file.go" should return all of them, not an arbitrary subset. A global `graph_max_visited` cap (default 2000) bounds pathological blowup on dense graphs, and a `graph_min_retention_for_expansion` pre-filter (default 0.05) skips heavily-decayed neighbors during BFS so they don't pollute the candidate set or waste the visited budget. Both knobs live under `[memory]` in `reverie.toml`.
+
+Recall filters (`cluster_id`, `subtype`, `layer`, `tags_any`) apply uniformly to vector and graph hits. `expand_via_graph` is honored only on `round == 0`; on round 1+ it is silently ignored (an info log line is emitted) and recall falls back to pre-7C behavior.
 
 ## Configuration
 

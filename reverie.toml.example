@@ -26,6 +26,26 @@ retention_threshold = 0.30
 # existing fact of the same subtype (temporal conflict resolution on write).
 conflict_threshold = 0.92
 
+# Per-hop decay constant for graph-aware recall composite scoring:
+#   composite = seed_similarity * neighbor_retention * (graph_decay_per_hop ^ distance)
+# Halving (0.5) is a sensible default. Lower values penalize distant
+# neighbors more aggressively; higher values let multi-hop reaches keep
+# more of the seed's score.
+graph_decay_per_hop = 0.5
+
+# Global cap on distinct neighbor memory IDs visited during graph BFS.
+# Prevents pathological blowup on dense graphs (e.g., a hub entity with
+# hundreds of mentions). When the cap is reached, BFS stops; remaining
+# expansion is dropped. Default 2000; raise if you have very dense
+# subgraphs and recall is missing relevant neighbors.
+graph_max_visited = 2000
+
+# Skip graph neighbors during BFS whose retention falls below this
+# threshold -- decayed memories don't pollute the candidate set and
+# don't waste the visited cap. Default 0.05 (very lenient; only the
+# most-decayed are filtered).
+graph_min_retention_for_expansion = 0.05
+
 [decay]
 # Temperature (T) controls how slowly memories fade. Higher values make decay
 # more gradual — a cluster needs more idle turns before its retention drops

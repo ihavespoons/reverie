@@ -1093,6 +1093,266 @@ func (m *memStore) ListEntitiesByMemoryIDs(_ context.Context, memoryIDs []string
 	return out, nil
 }
 
+// ExpandViaGraph implementation -- see docs/design/phase-7c-graph-aware-recall.md.
+//
+// Phase 7C: BFS walks memory_edges and entity_mentions outward from
+// seedIDs to at most hops levels deep, returning one GraphHit per
+// (neighbor, seed) pair at that pair's shortest distance. Hops clamped
+// to [1,3] defensively. minRetention<=0 disables the retention
+// pre-filter; maxVisited<=0 disables the global visited cap.
+func (m *memStore) ExpandViaGraph(_ context.Context, seedIDs []string, hops int, minRetention float64, maxVisited int) ([]GraphHit, error) {
+	if hops < 1 {
+		hops = 1
+	}
+	if hops > 3 {
+		hops = 3
+	}
+	if len(seedIDs) == 0 {
+		return nil, nil
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// pair key for (memID, seedID)
+	type pairKey struct {
+		mem  string
+		seed string
+	}
+
+	bestPair := make(map[pairKey]int)
+	globalVisited := make(map[string]struct{})
+	type frontierEntry struct {
+		mem  string
+		seed string
+	}
+	var frontier []frontierEntry
+
+	seedSet := make(map[string]struct{}, len(seedIDs))
+	for _, s := range seedIDs {
+		if _, dup := seedSet[s]; dup {
+			continue
+		}
+		seedSet[s] = struct{}{}
+		bestPair[pairKey{s, s}] = 0
+		globalVisited[s] = struct{}{}
+		frontier = append(frontier, frontierEntry{mem: s, seed: s})
+	}
+
+	results := make([]GraphHit, 0)
+
+	// Cluster-retention cache for the duration of this BFS.
+	clusterRetention := make(map[string]float64)
+	getClusterRetention := func(clusterID string) float64 {
+		if r, ok := clusterRetention[clusterID]; ok {
+			return r
+		}
+		c, ok := m.clusters[clusterID]
+		if !ok {
+			clusterRetention[clusterID] = 0
+			return 0
+		}
+		r := ebbinghaus.Retention(c.TurnsSince, c.Utility, c.Frequency, ebbinghaus.DefaultTemperature)
+		clusterRetention[clusterID] = r
+		return r
+	}
+
+	// resolveMemoryLayer returns ("l2_semantic", clusterID, true) for facts,
+	// ("l3_episodic", clusterID, true) for episodes, ("", "", false)
+	// otherwise (e.g., entity id or unknown).
+	resolveMemoryLayer := func(id string) (string, string, bool) {
+		if f, ok := m.facts[id]; ok {
+			return string(TypeL2Semantic), f.ClusterID, true
+		}
+		if ep, ok := m.episodes[id]; ok {
+			return string(TypeL3Episodic), ep.ClusterID, true
+		}
+		return "", "", false
+	}
+
+	entityRetentionByID := make(map[string]float64, len(m.entities))
+	for _, ent := range m.entities {
+		entityRetentionByID[ent.ID] = ent.Retention
+	}
+
+	capReached := func() bool {
+		return maxVisited > 0 && len(globalVisited) >= maxVisited
+	}
+
+	for depth := 1; depth <= hops; depth++ {
+		if len(frontier) == 0 {
+			break
+		}
+		if capReached() {
+			break
+		}
+		var nextFrontier []frontierEntry
+
+		// Snapshot per-iteration frontier IDs for fast lookup.
+		frontierMems := make(map[string][]string) // memID -> seedIDs reaching this mem at current frontier
+		for _, fe := range frontier {
+			frontierMems[fe.mem] = append(frontierMems[fe.mem], fe.seed)
+		}
+
+		// (a) memory_edges -- one-hop edge neighbors.
+		stopOuter := false
+		for _, e := range m.edges {
+			// Determine which side(s) are in the frontier.
+			seedsFromSrc, srcIn := frontierMems[e.SrcID]
+			seedsFromDst, dstIn := frontierMems[e.DstID]
+			if !srcIn && !dstIn {
+				continue
+			}
+			// Walk pairs: (parent, other)
+			tryReach := func(parent, other string, seeds []string) bool {
+				// Skip entity destinations (entities are mediators only).
+				layer, clusterID, isMem := resolveMemoryLayer(other)
+				if !isMem {
+					return false
+				}
+				if other == parent {
+					return false
+				}
+				if minRetention > 0 {
+					if r := getClusterRetention(clusterID); r < minRetention {
+						return false
+					}
+				}
+				for _, seedID := range seeds {
+					if other == seedID {
+						continue
+					}
+					key := pairKey{mem: other, seed: seedID}
+					if _, exists := bestPair[key]; exists {
+						continue
+					}
+					bestPair[key] = depth
+					results = append(results, GraphHit{
+						NeighborID:    other,
+						NeighborLayer: layer,
+						SeedID:        seedID,
+						Distance:      depth,
+					})
+					nextFrontier = append(nextFrontier, frontierEntry{mem: other, seed: seedID})
+					if _, gv := globalVisited[other]; !gv {
+						globalVisited[other] = struct{}{}
+						if capReached() {
+							return true
+						}
+					}
+				}
+				return false
+			}
+
+			if srcIn {
+				if tryReach(e.SrcID, e.DstID, seedsFromSrc) {
+					stopOuter = true
+					break
+				}
+			}
+			if dstIn {
+				if tryReach(e.DstID, e.SrcID, seedsFromDst) {
+					stopOuter = true
+					break
+				}
+			}
+		}
+
+		if stopOuter {
+			break
+		}
+
+		// (b) memory->entity->memory -- 2-hop entity mediator. Only
+		// produces results if depth+1 <= hops.
+		if depth+1 <= hops && !capReached() {
+			// Build memory->entityIDs map and entity->memoryIDs map
+			// scoped to the current frontier.
+			frontierMemSet := frontierMems
+			// For each frontier memory, find its entities, then for each
+			// entity find its memories.
+			memToEntities := make(map[string][]string)
+			for _, mn := range m.mentions {
+				if _, ok := frontierMemSet[mn.MemoryID]; !ok {
+					continue
+				}
+				if minRetention > 0 {
+					if r, ok := entityRetentionByID[mn.EntityID]; ok && r < minRetention {
+						continue
+					}
+				}
+				memToEntities[mn.MemoryID] = append(memToEntities[mn.MemoryID], mn.EntityID)
+			}
+			// For each entity, gather memory_ids that mention it.
+			entityToMems := make(map[string][]string)
+			neededEntities := make(map[string]struct{})
+			for _, eids := range memToEntities {
+				for _, eid := range eids {
+					neededEntities[eid] = struct{}{}
+				}
+			}
+			for _, mn := range m.mentions {
+				if _, want := neededEntities[mn.EntityID]; !want {
+					continue
+				}
+				entityToMems[mn.EntityID] = append(entityToMems[mn.EntityID], mn.MemoryID)
+			}
+
+			stop := false
+		outerEnt:
+			for parentMem, seeds := range frontierMemSet {
+				eids := memToEntities[parentMem]
+				for _, eid := range eids {
+					mids := entityToMems[eid]
+					for _, n := range mids {
+						if n == parentMem {
+							continue
+						}
+						layer, clusterID, isMem := resolveMemoryLayer(n)
+						if !isMem {
+							continue
+						}
+						if minRetention > 0 {
+							if r := getClusterRetention(clusterID); r < minRetention {
+								continue
+							}
+						}
+						for _, seedID := range seeds {
+							if n == seedID {
+								continue
+							}
+							key := pairKey{mem: n, seed: seedID}
+							if _, exists := bestPair[key]; exists {
+								continue
+							}
+							bestPair[key] = depth + 1
+							results = append(results, GraphHit{
+								NeighborID:    n,
+								NeighborLayer: layer,
+								SeedID:        seedID,
+								Distance:      depth + 1,
+							})
+							if _, gv := globalVisited[n]; !gv {
+								globalVisited[n] = struct{}{}
+								if capReached() {
+									stop = true
+									break outerEnt
+								}
+							}
+						}
+					}
+				}
+			}
+			if stop {
+				break
+			}
+		}
+
+		frontier = nextFrontier
+	}
+
+	return results, nil
+}
+
 // CountEntities returns the total number of entities. Mirrors the
 // sqliteStore counter; used by reverie://status.
 func (m *memStore) CountEntities(_ context.Context) (int, error) {
