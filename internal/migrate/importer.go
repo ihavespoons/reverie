@@ -9,9 +9,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"personal/reverie/internal/cluster"
-	"personal/reverie/internal/embed"
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/cluster"
+	"github.com/diffsec/reverie/internal/embed"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // ImportResult summarizes a migration run.

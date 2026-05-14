@@ -1,6 +1,6 @@
 # Phase 3 — Write fidelity
 
-Status: **DESIGN** (not yet implemented)
+Status: **IMPLEMENTED** (`c9f57f6` dry_run, `6ea69f8` writable confidence, `fbfad14` decay_tick cleanup, `787838c` batched forget)
 Prereqs: Phase 1 merged (tags wiring, `memory_get` shape)
 Unblocks: nothing downstream depends on Phase 3 hard; Phase 4 is independent.
 

@@ -4,8 +4,8 @@ import (
 	"math"
 	"testing"
 
-	"personal/reverie/internal/memory"
-	"personal/reverie/pkg/ebbinghaus"
+	"github.com/diffsec/reverie/internal/memory"
+	"github.com/diffsec/reverie/pkg/ebbinghaus"
 )
 
 func TestNewDecayer(t *testing.T) {

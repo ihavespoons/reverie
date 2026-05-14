@@ -5,7 +5,7 @@ import (
 	"math"
 	"testing"
 
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // fakeDecayer satisfies the local decayer interface for testing. The manager

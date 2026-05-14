@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"math"
 
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // bufferMutation is a closure that modifies a WorkingMemory in-place during

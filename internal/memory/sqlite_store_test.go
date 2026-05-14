@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"personal/reverie/internal/db"
+	"github.com/diffsec/reverie/internal/db"
 )
 
 func openTestDB(t *testing.T) *sqliteStore {

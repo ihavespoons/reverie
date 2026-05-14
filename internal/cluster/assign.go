@@ -10,8 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"personal/reverie/internal/memory"
-	"personal/reverie/pkg/vecmath"
+	"github.com/diffsec/reverie/internal/memory"
+	"github.com/diffsec/reverie/pkg/vecmath"
 )
 
 // Assigner decides which cluster a new memory belongs to, creating a fresh

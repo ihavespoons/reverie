@@ -1,6 +1,6 @@
 # Phase 5 — Observability
 
-Status: **DESIGN** (not yet implemented)
+Status: **IMPLEMENTED** (`ee3776b` status enrichment, `b1f664f` l1/at_risk resource, `18e293c` daily_stats + stats/daily resource)
 Prereqs: Phase 1 merged (migration framework; 5C adds migration 3)
 Unblocks: nothing — Phase 5 is self-contained observability.
 

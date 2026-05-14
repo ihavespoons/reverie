@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // MemoryManager reinforces utility/frequency on accessed clusters and

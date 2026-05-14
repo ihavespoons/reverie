@@ -1,4 +1,4 @@
-module personal/reverie
+module github.com/diffsec/reverie
 
 go 1.26.2
 

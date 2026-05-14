@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // CachedProvider wraps an EmbeddingProvider with a SHA-256-keyed SQLite cache

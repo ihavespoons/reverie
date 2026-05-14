@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"personal/reverie/internal/cluster"
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/cluster"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // stubEmbedder returns a fixed-length vector for any input text.

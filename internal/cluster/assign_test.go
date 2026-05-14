@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // ---------------------------------------------------------------------------

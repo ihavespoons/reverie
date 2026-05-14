@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"personal/reverie/internal/db"
+	"github.com/diffsec/reverie/internal/db"
 )
 
 // fakeProvider is a test EmbeddingProvider that counts Embed calls and returns

@@ -13,8 +13,8 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"personal/reverie/internal/embed"
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/embed"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // registerResources adds all resource definitions to the SDK server.

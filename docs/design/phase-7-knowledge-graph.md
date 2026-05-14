@@ -1,6 +1,6 @@
 # Phase 7 -- Knowledge Graph
 
-Status: **DESIGN** (not yet implemented)
+Status: **IMPLEMENTED** (`3cd9c79` migration 5 + store + MCP surface + decay + status, `7f47df1` README + .gitignore)
 Prereqs: Phase 1 merged (migration framework); Phase 4 merged (`memory_link`/`memory_unlink`/`memory_list_links` -- retired by this phase).
 Unblocks: Phase 7C (graph-aware recall -- deferred from this phase).
 

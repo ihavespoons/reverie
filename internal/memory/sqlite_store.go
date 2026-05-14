@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/diffsec/reverie/pkg/ebbinghaus"
+	"github.com/diffsec/reverie/pkg/vecmath"
 	"github.com/google/uuid"
-	"personal/reverie/pkg/ebbinghaus"
-	"personal/reverie/pkg/vecmath"
 )
 
 const (

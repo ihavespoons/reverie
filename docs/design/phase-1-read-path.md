@@ -1,6 +1,6 @@
 # Phase 1 — Read-path truth
 
-Status: **DESIGN** (not yet implemented)
+Status: **IMPLEMENTED** (initial commit `75af8e4` + read-path tooling `478367a`, `d365572`, `6bb4c56`, `c5df14c`, `18f4c87`)
 Prereqs: none
 Unblocks: Phase 2 (curation), Phase 4 (supersede chain exposure uses `memory_get`)
 

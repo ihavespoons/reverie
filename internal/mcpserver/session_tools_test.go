@@ -5,11 +5,11 @@ import (
 	"strings"
 	"testing"
 
-	"personal/reverie/internal/cluster"
-	"personal/reverie/internal/config"
-	"personal/reverie/internal/decay"
-	"personal/reverie/internal/manager"
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/cluster"
+	"github.com/diffsec/reverie/internal/config"
+	"github.com/diffsec/reverie/internal/decay"
+	"github.com/diffsec/reverie/internal/manager"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // newSessionTestServer builds a server with a pre-populated session. The

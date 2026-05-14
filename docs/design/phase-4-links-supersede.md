@@ -1,6 +1,6 @@
 # Phase 4 — Links & supersede
 
-Status: **DESIGN** (not yet implemented)
+Status: **IMPLEMENTED** (`44274c8` link/unlink/list_links, `34866d1` unsupersede). Note: Phase 7 (`3cd9c79`) retired the `memory_link*` tools and migrated `fact_episode_links` rows into `memory_edges`; this doc is preserved as historical context for the original cross-type link design.
 Prereqs: Phase 1 merged (`memory_get` already exposes supersede chain and link IDs)
 Unblocks: nothing downstream hard-depends on Phase 4.
 

@@ -65,7 +65,7 @@ If `reverie` isn't on your `$PATH`, use the full path:
   "mcp": {
     "reverie": {
       "type": "local",
-      "command": ["/Users/you/Code/personal/reverie/reverie", "serve"],
+      "command": ["/Users/you/Code/github.com/diffsec/reverie/reverie", "serve"],
       "enabled": true
     }
   }

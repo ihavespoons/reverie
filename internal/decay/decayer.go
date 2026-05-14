@@ -5,8 +5,8 @@
 package decay
 
 import (
-	"personal/reverie/internal/memory"
-	"personal/reverie/pkg/ebbinghaus"
+	"github.com/diffsec/reverie/internal/memory"
+	"github.com/diffsec/reverie/pkg/ebbinghaus"
 )
 
 // Decayer evaluates Gate C (Ebbinghaus retention) on individual clusters.

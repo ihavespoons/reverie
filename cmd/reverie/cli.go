@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"personal/reverie/internal/config"
-	"personal/reverie/internal/db"
-	"personal/reverie/internal/embed"
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/config"
+	"github.com/diffsec/reverie/internal/db"
+	"github.com/diffsec/reverie/internal/embed"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // parseArgs parses CLI flags from a slice of arguments into a map.

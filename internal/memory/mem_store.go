@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/diffsec/reverie/pkg/ebbinghaus"
+	"github.com/diffsec/reverie/pkg/vecmath"
 	"github.com/google/uuid"
-	"personal/reverie/pkg/ebbinghaus"
-	"personal/reverie/pkg/vecmath"
 )
 
 // edgeRow is the in-memory mirror of a memory_edges row.

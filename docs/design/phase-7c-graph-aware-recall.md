@@ -1,6 +1,6 @@
 # Phase 7C -- Graph-aware Recall
 
-Status: **DESIGN** (not yet implemented)
+Status: **IMPLEMENTED** (`d9b8b40` ExpandViaGraph + handleRecall + docs/config, `8067247` decay_per_hop default bumped 0.5 → 0.8 after end-to-end testing)
 Prereqs: Phase 7 merged (`memory_edges`, `entities`, `entity_mentions` tables; `ListEdges`, `ListMemoriesByEntity`, `GetEntity`, `ListEntitiesByMemoryIDs` store methods).
 Unblocks: nothing -- Phase 7C completes the knowledge-graph payoff story.
 

@@ -9,12 +9,12 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"personal/reverie/internal/cluster"
-	"personal/reverie/internal/config"
-	"personal/reverie/internal/decay"
-	"personal/reverie/internal/embed"
-	"personal/reverie/internal/manager"
-	"personal/reverie/internal/memory"
+	"github.com/diffsec/reverie/internal/cluster"
+	"github.com/diffsec/reverie/internal/config"
+	"github.com/diffsec/reverie/internal/decay"
+	"github.com/diffsec/reverie/internal/embed"
+	"github.com/diffsec/reverie/internal/manager"
+	"github.com/diffsec/reverie/internal/memory"
 )
 
 // stubEmbedder is a test double for embed.EmbeddingProvider. It returns

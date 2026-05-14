@@ -1,6 +1,6 @@
 # Phase 6 — Working memory & sessions
 
-Status: **DESIGN** (6a is the design pass; 6b–6d implement)
+Status: **IMPLEMENTED** (6a is this design doc; `c720c07` 6b session plumbing, `df270db` 6c session tools, `f188851` 6d session resource + prompts)
 Prereqs: Phase 1 migration framework.
 Unblocks: nothing — Phase 6 completes the paper-faithful architecture.
 

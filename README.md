@@ -154,7 +154,14 @@ See [docs/custom-harness.md](docs/custom-harness.md) for examples.
 | `memory_reinforce` | Boost utility of memories actually used in a response. Accepts optional `session_id`. | After using recalled memories. |
 | `memory_forget` | Delete by ID, or search for deletion candidates by query. | On correction; on explicit "forget X". |
 | `memory_list` | Browse/audit memories with filtering and pagination. | Inspection. |
+| `memory_get` | Fetch a single fact or episode by ID. Returns full record including cluster metadata, supersede chain, cross-type links. | When you need the complete history of a specific memory (audit, supersede chains). |
+| `memory_update_content` | Amend a fact's content or an episode's situation/action/outcome/preemptive in place. | On factual corrections that should overwrite rather than supersede. |
+| `memory_unsupersede` | Reverse an auto-supersede by clearing `superseded_by` on a fact, reactivating it. | When a heuristic supersede was wrong and the older fact is the correct one. |
 | `memory_decay_tick` | Advance the decay clock (internal). | Scheduled jobs; not called by agents directly. Use `memory_session_end` for session-scoped ticks. |
+| `memory_update_cluster` | Update an L1 cluster's summary, domain label, or meta-instruction. | When curating the L1 meta-index. |
+| `memory_reassign_cluster` | Move a single fact or episode into a different cluster. | When auto-clustering placed a memory in the wrong cluster. |
+| `memory_split_cluster` | Partition a cluster's members into new clusters by explicit ID groups. | When one cluster has grown to span unrelated topics. |
+| `memory_merge_clusters` | Merge N source clusters into a single target; reparents members and deletes sources. | When two clusters represent the same topic and should be unified. |
 | `memory_session_init` | Create or resume a named session; returns the persisted working-memory buffer. | At the start of every conversation that wants resumable memory. |
 | `memory_session_snapshot` | Force-flush the current buffer to the session store. | Explicit checkpoint; normally implicit after each mutation. |
 | `memory_session_restore` | Read the buffer and metadata for a session without `init` semantics. | Inspection / audit. |
@@ -209,7 +216,7 @@ Reverie's graph layer connects memories (L2 facts, L3 episodes) and entities thr
 
 Vector recall finds memories whose text is similar to the query; graph expansion finds memories related to those seeds *through structure* -- direct edges (`causes` / `refines` / `contradicts` / ...) and shared entity mentions. Set `expand_via_graph: true` on `memory_recall` to walk the graph from each vector seed and merge reachable neighbors into the candidate set. This is the recommended mode for "what do I know about file X" questions, where the answer memories often don't share keywords with the query.
 
-Neighbors are scored by `composite = seed_similarity * neighbor_retention * (graph_decay_per_hop ^ distance)`. With the default `graph_decay_per_hop = 0.5` and the default hop budget of 2, a memory that only shares an entity with a vector seed (memory -> entity -> memory, distance 2) still reaches the candidate set, scored at a quarter of the seed's contribution. `graph_hops` (1-3) overrides the budget per call.
+Neighbors are scored by `composite = seed_similarity * neighbor_retention * (graph_decay_per_hop ^ distance)`. With the default `graph_decay_per_hop = 0.8` and the default hop budget of 2, a memory that only shares an entity with a vector seed (memory -> entity -> memory, distance 2) still reaches the candidate set, scored at 0.64 of the seed's contribution -- enough for graph hits to compete with vector hits when the embedding model produces a high similarity baseline. `graph_hops` (1-3) overrides the budget per call.
 
 Each `RecallCandidate` carries a `distance` field: `0` for vector hits, `>= 1` for graph neighbors at that BFS depth. Graph-only neighbors have `similarity = 0`, `gate_b_pass = false` deterministically (they were not found by cosine similarity, so the similarity gate does not apply). The `limit` is applied after merge -- top-N by `composite_score` survives, so a request for 10 results may return any mix of vector and graph hits.
 
@@ -230,7 +237,7 @@ Key settings:
 
 See [reverie.toml.example](reverie.toml.example) for the full annotated config.
 
-Environment variable overrides: `REVERIE_DB_PATH`, `REVERIE_EMBED_URL`, `REVERIE_EMBED_MODEL`, `REVERIE_CONFIG`, `REVERIE_LOG_LEVEL`, `REVERIE_DISABLED=1`.
+Environment variable overrides: `REVERIE_DB_PATH`, `REVERIE_EMBED_URL`, `REVERIE_EMBED_MODEL`, `REVERIE_CONFIG`, `REVERIE_LOG_LEVEL`, `REVERIE_DISABLED=1`. Embedding-provider credentials (when applicable): `VOYAGE_API_KEY`, `OPENAI_API_KEY`.
 
 ## Replacing auto-memory
 
@@ -250,4 +257,4 @@ REVERIE_SMOKE_TEST=1 go test ./internal/embed/ -run Smoke -v
 
 ## License
 
-TODO: pick a license.
+MIT -- see [LICENSE](LICENSE).

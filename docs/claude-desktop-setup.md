@@ -20,7 +20,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "reverie": {
       "type": "stdio",
-      "command": "/Users/you/Code/personal/reverie/reverie",
+      "command": "/Users/you/Code/github.com/diffsec/reverie/reverie",
       "args": ["serve"]
     }
   }

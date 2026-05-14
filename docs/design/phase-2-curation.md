@@ -1,6 +1,6 @@
 # Phase 2 — Curation tools
 
-Status: **DESIGN** (not yet implemented)
+Status: **IMPLEMENTED** (`4879609` reassign_cluster, `aac9e0f` merge_clusters, `4712446` split_cluster, `424e507` update_content, `b4a6374` recall filters)
 Prereqs: Phase 1 merged (`cluster_id` on results, `memory_get`, `reverie://l1/cluster/{id}`, tags)
 Unblocks: Phase 3 (`dry_run` reuses supersede preview logic), Phase 4 (link ops don't depend on this but land after)
 
